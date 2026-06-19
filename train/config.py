@@ -37,13 +37,13 @@ LORA_DIR = os.path.join(CHECKPOINT_DIR, "lora")
 # 训练超参数
 # ============================================================
 MAX_LENGTH = 512          # DeBERTa 最大序列长度
-MLM_PROB = 0.15           # MLM 掩码比例
 
-# 预训练
-PRETRAIN_BATCH_SIZE = 8
+# SimCSE 预训练
+PRETRAIN_BATCH_SIZE = 8   # SimCSE 受益于大 batch（更多负样本），显存允许可调到 16/32
 PRETRAIN_EPOCHS = 3
-PRETRAIN_LR = 5e-6  # ELECTRA bias 置零后从零学，需要更小步长
-PRETRAIN_WARMUP = 2000  # 加长 warmup，平稳过渡
+PRETRAIN_LR = 3e-5        # SimCSE 标准学习率
+PRETRAIN_WARMUP = 1000
+SIMCSE_TEMPERATURE = 0.05  # 对比 loss 温度系数
 
 # LoRA 微调
 LORA_BATCH_SIZE = 16

@@ -1,36 +1,28 @@
 """
-步骤3：MLM 预训练
-目的：让 DeBERTa 适应加密流量领域的数据分布
+步骤3：SimCSE 对比学习预训练
+目的：让 DeBERTa-v3 Encoder 适应加密流量领域的数据分布
 
 输入：全部流的文本序列（不需要 label）
-输出：checkpoints/pretrain/ 下的模型权重
+输出：checkpoints/pretrain/ 下的 Encoder 权重
 
-方法：Masked Language Modeling
-  - 随机遮住 15% 的 token
-  - 让模型预测被遮住的是什么
-  - 反复几轮后，模型学会了流量序列的"语法"
+方法：SimCSE（Simple Contrastive Sentence Embedding，ACL 2021）
+  - 同一条流文本过 Encoder 两遍（不同 dropout），[CLS] 输出形成正样本对
+  - 同一个 batch 内其他流的 [CLS] 是负样本
+  - 对比损失拉近正样本对、推远负样本对
+  - Encoder 学会在特征空间中区分不同流量的"语义"
 
-===== 关于 MLM 头加载 =====
-
-DeBERTa-v3 的 MLM 预测头 key 名与 AutoModelForMaskedLM 期望不一致。
-通过手动映射 5 个同 shape key 加载 transform 部分权重，
-decoder 权重与 embedding 绑定自动复用。
-decoder.bias（128100维）是 token 先验，在 checkpoint 中不存在，
-且 ELECTRA 源域的 token 分布不适用于加密流量文本，置零从数据中学。
-
-加载流程：手动映射 5 key → decoder.bias 置零 → cls.predictions.bias 置零。
+为什么不用 MLM：
+  DeBERTa-v3 是 ELECTRA/RTD 预训练的，checkpoint 中 MLM 头 key 名与
+  AutoModelForMaskedLM 期望不兼容。SimCSE 只使用 Encoder，天然避免此问题。
+  且 SimCSE 直接在 [CLS] 768 维空间中训练，与最终交付物（[CLS] 特征向量）同空间。
 """
 
 import os
 import json
 import torch
-from torch.utils.data import DataLoader
-from transformers import (
-    AutoTokenizer,
-    AutoModelForMaskedLM,
-    DataCollatorForLanguageModeling,
-    get_linear_schedule_with_warmup,
-)
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
 from config import (
@@ -38,46 +30,49 @@ from config import (
     FLOWS_JSONL,
     PRETRAIN_DIR,
     MAX_LENGTH,
-    MLM_PROB,
     PRETRAIN_BATCH_SIZE,
     PRETRAIN_EPOCHS,
     PRETRAIN_LR,
     PRETRAIN_WARMUP,
+    SIMCSE_TEMPERATURE,
     SEED,
 )
 
 
-def _remap_mlm_head(model, model_dir):
-    """手动映射 DeBERTa-v3 MLM 预测头：checkpoint key → transformers 期望的 key。"""
-    import os as _os
-    sf_path = _os.path.join(model_dir, "model.safetensors")
-    bin_path = _os.path.join(model_dir, "pytorch_model.bin")
-    if _os.path.exists(sf_path):
-        from safetensors.torch import load_file
-        raw = load_file(sf_path)
-    else:
-        raw = torch.load(bin_path, map_location="cpu", weights_only=True)
+# SimCSE 专属参数
+TEMPERATURE = SIMCSE_TEMPERATURE
 
-    ckpt = model.state_dict()
-    mapping = [
-        ("lm_predictions.lm_head.dense.weight",       "cls.predictions.transform.dense.weight"),
-        ("lm_predictions.lm_head.dense.bias",         "cls.predictions.transform.dense.bias"),
-        ("lm_predictions.lm_head.LayerNorm.weight",   "cls.predictions.transform.LayerNorm.weight"),
-        ("lm_predictions.lm_head.LayerNorm.bias",     "cls.predictions.transform.LayerNorm.bias"),
-        ("lm_predictions.lm_head.bias",               "cls.predictions.bias"),
-    ]
-    loaded = 0
-    for ckpt_key, model_key in mapping:
-        if ckpt_key in raw and model_key in ckpt:
-            ckpt[model_key] = raw[ckpt_key]
-            loaded += 1
 
-    # ELECTRA 预训练的 bias 不适用本领域文本分布，置零从头学
-    ckpt["cls.predictions.bias"].zero_()
-    ckpt["cls.predictions.decoder.bias"].zero_()
+class SimCSEDataset(Dataset):
+    """最简单的文本 Dataset，返回 input_ids + attention_mask。"""
 
-    model.load_state_dict(ckpt)
-    print(f"  MLM 头映射: {loaded}/{len(mapping)} 个 key，bias 已置零")
+    def __init__(self, texts, tokenizer, max_length=MAX_LENGTH):
+        self.input_ids = []
+        self.attention_mask = []
+        # 分批 tokenize 避免爆内存，但数据量不大时一次做完更快
+        for i in range(0, len(texts), 2048):
+            chunk = texts[i : i + 2048]
+            tok = tokenizer(
+                chunk,
+                max_length=max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            self.input_ids.append(tok["input_ids"])
+            self.attention_mask.append(tok["attention_mask"])
+
+        self.input_ids = torch.cat(self.input_ids, dim=0)
+        self.attention_mask = torch.cat(self.attention_mask, dim=0)
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": self.input_ids[idx],
+            "attention_mask": self.attention_mask[idx],
+        }
 
 
 def load_all_texts(jsonl_path=None):
@@ -99,9 +94,46 @@ def load_all_texts(jsonl_path=None):
     return texts
 
 
+def simcse_loss(z1, z2, temperature=TEMPERATURE):
+    """
+    SimCSE InfoNCE loss。
+
+    参数:
+        z1: 第一遍的 [CLS] 向量，shape [N, D]
+        z2: 第二遍的 [CLS] 向量，shape [N, D]
+        temperature: 温度系数
+
+    Returns:
+        loss: 标量
+
+    计算逻辑：
+        z1 和 z2 拼成 [2N, D]，算相似矩阵 [2N, 2N]。
+        z1[i] 的正样本是 z2[i]（即矩阵中行 i 对应列 i+N）。
+        z2[i] 的正样本是 z1[i]（即矩阵中行 i+N 对应列 i）。
+        对角位置 (i, i) 是自身，mask 掉。
+        CrossEntropy 会自动在 2N-1 个负类中找到正类。
+    """
+    z1 = F.normalize(z1, dim=1)
+    z2 = F.normalize(z2, dim=1)
+
+    N = z1.size(0)
+    z_all = torch.cat([z1, z2], dim=0)          # [2N, D]
+    sim = torch.mm(z_all, z_all.t()) / temperature  # [2N, 2N]
+
+    # 正样本标签：z1[i]→i+N,  z2[i]→i
+    labels = torch.cat([torch.arange(N, 2 * N), torch.arange(N)]).to(z1.device)
+
+    # mask 掉自身（对角线），避免自己和自己的无穷大相似
+    mask = torch.eye(2 * N, dtype=torch.bool, device=z1.device)
+    sim = sim.masked_fill(mask, float("-inf"))
+
+    loss = F.cross_entropy(sim, labels)
+    return loss
+
+
 def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
     """
-    MLM 预训练主函数。
+    SimCSE 预训练主函数。
 
     参数可选，方便调参；None 则用 config 默认值。
     """
@@ -120,54 +152,27 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
     texts = load_all_texts(jsonl_path)
 
     # ========================================
-    # 2. 加载 tokenizer 和模型
+    # 2. 加载 tokenizer 和 Encoder
     # ========================================
-    print("\n[2/5] 加载 tokenizer & 模型")
+    print("\n[2/5] 加载 tokenizer & Encoder")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-    # 模型加载：DeBERTa-v3 的 MLM 头 key 名与 transformers 期望不一致
-    # lm_predictions.lm_head.* → cls.predictions.transform.* (shape 相同，手动映射)
-    # decoder 与 embedding 绑定，自动复用
-    model = AutoModelForMaskedLM.from_pretrained(MODEL_DIR)
-    _remap_mlm_head(model, MODEL_DIR)
+    # SimCSE 只需要 Encoder，不碰任何 MLM/ELECTRA 头，不存在 key 不匹配问题
+    model = AutoModel.from_pretrained(MODEL_DIR)
+
     print(f"  模型参数量: {sum(p.numel() for p in model.parameters()):,}")
 
     # ========================================
-    # 3. 分词 + DataCollator
+    # 3. 准备 DataLoader
     # ========================================
     print("\n[3/5] 分词 & 准备数据")
 
-    # 分批 tokenize，避免一次性加载全部到内存
-    tokenized = tokenizer(
-        texts,
-        max_length=MAX_LENGTH,
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt",
-    )
-    input_ids = tokenized["input_ids"]
-    attention_mask = tokenized["attention_mask"]
-
-    print(f"  input_ids shape: {input_ids.shape}")
-
-    # DataCollator 自动处理随机 mask
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=True,
-        mlm_probability=MLM_PROB,
-    )
-
-    # 简单的 list of dict 格式给 collator
-    dataset = [
-        {"input_ids": input_ids[i], "attention_mask": attention_mask[i]}
-        for i in range(len(input_ids))
-    ]
-
+    dataset = SimCSEDataset(texts, tokenizer, MAX_LENGTH)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=data_collator,
+        drop_last=True,  # 丢掉不够一个 batch 的尾巴，避免 batch_size=1
     )
 
     print(f"  batch 数: {len(dataloader)} (batch_size={batch_size})")
@@ -175,8 +180,8 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
     # ========================================
     # 4. 训练
     # ========================================
-    print(f"\n[4/5] 开始 MLM 预训练")
-    print(f"  epochs={epochs}, lr={lr}, warmup={PRETRAIN_WARMUP}")
+    print(f"\n[4/5] 开始 SimCSE 对比学习预训练")
+    print(f"  epochs={epochs}, lr={lr}, temperature={TEMPERATURE}, warmup={PRETRAIN_WARMUP}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  设备: {device}")
@@ -192,7 +197,6 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
 
     os.makedirs(PRETRAIN_DIR, exist_ok=True)
 
-    global_step = 0
     best_loss = float("inf")
 
     for epoch in range(1, epochs + 1):
@@ -202,26 +206,32 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{epochs}", unit="batch")
         for batch in pbar:
-            batch = {k: v.to(device) for k, v in batch.items()}
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
 
-            outputs = model(**batch)
-            loss = outputs.loss
+            # 第一遍前向（dropout 随机开启一组）
+            out1 = model(input_ids=input_ids, attention_mask=attention_mask)
+            z1 = out1.last_hidden_state[:, 0, :]  # [CLS] token, [N, 768]
+
+            # 第二遍前向（dropout 不同 → 输出略有差异）
+            out2 = model(input_ids=input_ids, attention_mask=attention_mask)
+            z2 = out2.last_hidden_state[:, 0, :]  # [CLS] token, [N, 768]
+
+            loss = simcse_loss(z1, z2, TEMPERATURE)
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 防梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
 
             epoch_loss += loss.item()
             epoch_steps += 1
-            global_step += 1
 
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         avg_loss = epoch_loss / epoch_steps
-        perplexity = torch.exp(torch.tensor(avg_loss)).item()
-        print(f"  Epoch {epoch} 完成: avg_loss={avg_loss:.4f}, perplexity={perplexity:.1f}")
+        print(f"  Epoch {epoch} 完成: avg_loss={avg_loss:.4f}")
 
         # 保存最佳
         if avg_loss < best_loss:
@@ -245,8 +255,8 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
 # 测试入口
 # ============================================================
 if __name__ == "__main__":
-    print("=== MLM 预训练测试 ===\n")
+    print("=== SimCSE 对比学习预训练 测试 ===\n")
     print("注意：当前测试数据只有 2457 条 + 无 label=1，仅验证流程不崩溃")
     print("正式训练需要全量数据 + GPU\n")
 
-    pretrain(epochs=1, batch_size=4)
+    pretrain(epochs=1, batch_size=8)
