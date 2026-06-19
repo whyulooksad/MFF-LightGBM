@@ -15,9 +15,18 @@ DATA_DIR = os.path.join(ROOT, "data")
 INPUT_DIR = os.path.join(DATA_DIR, "input")
 PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
 OUTPUT_DIR = os.path.join(DATA_DIR, "output")
+SPLIT_DIR = os.path.join(DATA_DIR, "splits")
 
 # 样例数据（欧鲁金给的，先用这个开发，正式数据放 input/）
 EXAMPLE_CSV = os.path.join(ROOT, "data_example", "merged_with_context_CIC-DoHBrw-2020.csv")
+
+# 正式输入CSV
+#   supervised_flows.csv: 有标签数据，用于LoRA分类训练和特征提取
+#   pretrain_flows.csv:  预训练语料，可以无label，不应包含最终监督测试集
+SUPERVISED_INPUT_CSV = os.path.join(INPUT_DIR, "supervised_flows.csv")
+PRETRAIN_INPUT_CSV = os.path.join(INPUT_DIR, "pretrain_flows.csv")
+
+# 兼容旧文件名：如果 supervised_flows.csv 不存在，会回退到这个路径
 INPUT_CSV = os.path.join(INPUT_DIR, "merged_with_context_CIC-DoHBrw-2020.csv")
 
 # 预处理输出
@@ -25,6 +34,11 @@ FLOWS_JSONL = os.path.join(PROCESSED_DIR, "flows.jsonl")
 
 # RTD继续预训练语料（可以无label；不要放最终监督测试集）
 PRETRAIN_FLOWS_JSONL = os.path.join(PROCESSED_DIR, "pretrain_flows.jsonl")
+
+# 固定监督训练划分
+TRAIN_JSONL = os.path.join(SPLIT_DIR, "train.jsonl")
+VAL_JSONL = os.path.join(SPLIT_DIR, "val.jsonl")
+TEST_JSONL = os.path.join(SPLIT_DIR, "test.jsonl")
 
 # 特征输出
 FEATURES_PURE_CSV = os.path.join(OUTPUT_DIR, "features_pure.csv")

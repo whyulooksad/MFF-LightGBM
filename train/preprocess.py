@@ -1,7 +1,9 @@
 """
 步骤1：数据预处理
 输入：任务一的 CSV 文件
-输出：data/processed/flows.jsonl（每条流一行 JSON）
+输出：
+    data/processed/pretrain_flows.jsonl（RTD继续预训练语料，可以无label）
+    data/processed/flows.jsonl（有标签监督训练/特征提取数据）
 
 核心逻辑：
 1. 按五元组归组（双向合并）
@@ -13,20 +15,35 @@
 """
 
 import json
-import re
 import pandas as pd
 from json.decoder import JSONDecoder
 from collections import defaultdict
 from tqdm import tqdm
 
-from config import (
-    EXAMPLE_CSV,
-    INPUT_CSV,
-    FLOWS_JSONL,
-    SSL_FIELDS,
-    X509_FIELDS,
-    NUM_FEATURES,
-)
+try:
+    from .config import (
+        EXAMPLE_CSV,
+        FLOWS_JSONL,
+        INPUT_CSV,
+        NUM_FEATURES,
+        PRETRAIN_FLOWS_JSONL,
+        PRETRAIN_INPUT_CSV,
+        SSL_FIELDS,
+        SUPERVISED_INPUT_CSV,
+        X509_FIELDS,
+    )
+except ImportError:
+    from config import (
+        EXAMPLE_CSV,
+        FLOWS_JSONL,
+        INPUT_CSV,
+        NUM_FEATURES,
+        PRETRAIN_FLOWS_JSONL,
+        PRETRAIN_INPUT_CSV,
+        SSL_FIELDS,
+        SUPERVISED_INPUT_CSV,
+        X509_FIELDS,
+    )
 
 
 # ============================================================
@@ -183,25 +200,44 @@ def extract_num_features(summary_json_str) -> dict:
 # 主流程
 # ============================================================
 
-def preprocess(csv_path: str = None, output_path: str = None, nrows: int = None):
+def resolve_default_csv(for_pretrain=False):
+    """按用途选择默认CSV路径。"""
+    import os
+
+    if for_pretrain:
+        if os.path.exists(PRETRAIN_INPUT_CSV):
+            return PRETRAIN_INPUT_CSV
+        print(f"[INFO] 预训练CSV不存在 ({PRETRAIN_INPUT_CSV})，使用样例数据")
+        return EXAMPLE_CSV
+
+    if os.path.exists(SUPERVISED_INPUT_CSV):
+        return SUPERVISED_INPUT_CSV
+    if os.path.exists(INPUT_CSV):
+        return INPUT_CSV
+    print(f"[INFO] 监督CSV不存在 ({SUPERVISED_INPUT_CSV} / {INPUT_CSV})，使用样例数据")
+    return EXAMPLE_CSV
+
+
+def preprocess(
+    csv_path: str = None,
+    output_path: str = None,
+    nrows: int = None,
+    for_pretrain: bool = False,
+):
     """
     主预处理函数。
 
     参数:
-        csv_path: 输入 CSV 路径，默认用样例数据
+        csv_path: 输入 CSV 路径，默认按 for_pretrain 选择 data/input 下的CSV
         output_path: 输出 JSONL 路径，默认用 config 中的路径
         nrows: 只读前 nrows 行（测试用，None=全读）
+        for_pretrain: True=生成 pretrain_flows.jsonl，False=生成 flows.jsonl
     """
     if csv_path is None:
-        # 优先用正式数据，没有则用样例
-        csv_path = INPUT_CSV
-        import os
-        if not os.path.exists(csv_path):
-            print(f"[INFO] 正式数据不存在 ({csv_path})，使用样例数据")
-            csv_path = EXAMPLE_CSV
+        csv_path = resolve_default_csv(for_pretrain=for_pretrain)
 
     if output_path is None:
-        output_path = FLOWS_JSONL
+        output_path = PRETRAIN_FLOWS_JSONL if for_pretrain else FLOWS_JSONL
 
     print(f"[1/5] 读取 CSV: {csv_path}")
     if nrows:
@@ -238,7 +274,7 @@ def preprocess(csv_path: str = None, output_path: str = None, nrows: int = None)
         # 从 context_text 提取所有事件
         all_events = []
         for _, row in group.iterrows():
-            ctx = row["context_text"]
+            ctx = row["context_text"] if "context_text" in row else None
             if pd.notna(ctx):
                 all_events.extend(parse_context_text(str(ctx)))
 
@@ -249,17 +285,19 @@ def preprocess(csv_path: str = None, output_path: str = None, nrows: int = None)
 
         # 取 label（同一条流的所有行 label 应该一致，取第一个非空）
         label = None
-        for _, row in group.iterrows():
-            if pd.notna(row["label"]):
-                label = int(row["label"])
-                break
+        if "label" in group.columns:
+            for _, row in group.iterrows():
+                if pd.notna(row["label"]):
+                    label = int(row["label"])
+                    break
 
         # 取 summary_json（取第一个非空的）
         summary_json_str = None
-        for _, row in group.iterrows():
-            if pd.notna(row["summary_json"]):
-                summary_json_str = str(row["summary_json"])
-                break
+        if "summary_json" in group.columns:
+            for _, row in group.iterrows():
+                if pd.notna(row["summary_json"]):
+                    summary_json_str = str(row["summary_json"])
+                    break
 
         # 构建流文本
         text = build_flow_text(all_events)
@@ -316,10 +354,59 @@ def preprocess(csv_path: str = None, output_path: str = None, nrows: int = None)
     return flows_output
 
 
+def preprocess_supervised(csv_path: str = None, output_path: str = None, nrows: int = None):
+    """生成有标签监督训练/特征提取数据：data/processed/flows.jsonl。"""
+    return preprocess(
+        csv_path=csv_path,
+        output_path=output_path or FLOWS_JSONL,
+        nrows=nrows,
+        for_pretrain=False,
+    )
+
+
+def preprocess_pretrain(csv_path: str = None, output_path: str = None, nrows: int = None):
+    """生成RTD继续预训练语料：data/processed/pretrain_flows.jsonl。"""
+    return preprocess(
+        csv_path=csv_path,
+        output_path=output_path or PRETRAIN_FLOWS_JSONL,
+        nrows=nrows,
+        for_pretrain=True,
+    )
+
+
+def preprocess_all(nrows: int = None):
+    """按约定同时生成 pretrain_flows.jsonl 和 flows.jsonl。"""
+    print("=== 生成RTD继续预训练语料 ===")
+    pretrain_flows = preprocess_pretrain(nrows=nrows)
+    print("\n=== 生成有标签监督训练/特征提取数据 ===")
+    supervised_flows = preprocess_supervised(nrows=nrows)
+    return pretrain_flows, supervised_flows
+
+
 # ============================================================
 # 入口
 # ============================================================
 if __name__ == "__main__":
-    # 测试：只取前 5000 行验证流程
-    # 正式跑：preprocess() 不加 nrows
-    preprocess(nrows=5000)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="预处理CSV并生成任务二JSONL数据")
+    parser.add_argument(
+        "--target",
+        choices=["all", "pretrain", "supervised"],
+        default="all",
+        help="要生成的数据集类型，默认all",
+    )
+    parser.add_argument(
+        "--nrows",
+        type=int,
+        default=None,
+        help="只读取前n行用于测试；默认全量处理",
+    )
+    args = parser.parse_args()
+
+    if args.target == "pretrain":
+        preprocess_pretrain(nrows=args.nrows)
+    elif args.target == "supervised":
+        preprocess_supervised(nrows=args.nrows)
+    else:
+        preprocess_all(nrows=args.nrows)

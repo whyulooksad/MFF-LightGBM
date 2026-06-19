@@ -40,7 +40,7 @@ try:
         PRETRAIN_DIR,
         SEED,
     )
-    from .dataset import FlowDataset, load_flows, split_flows
+    from .dataset import FlowDataset, get_or_create_splits, load_flows
 except ImportError:
     from config import (
         LORA_ALPHA,
@@ -56,7 +56,7 @@ except ImportError:
         PRETRAIN_DIR,
         SEED,
     )
-    from dataset import FlowDataset, load_flows, split_flows
+    from dataset import FlowDataset, get_or_create_splits, load_flows
 
 
 NUM_LABELS = 2
@@ -180,7 +180,7 @@ def train_lora_classifier(jsonl_path=None, base_model_dir=None, epochs=None, bat
     flows = load_flows(jsonl_path)
     if not flows:
         raise ValueError("没有可用于LoRA分类训练的有标签流")
-    train_flows, val_flows, test_flows = split_flows(flows)
+    train_flows, val_flows, test_flows = get_or_create_splits(flows=flows)
 
     print("\n[2/5] 加载tokenizer和Dataset")
     tokenizer = load_tokenizer(base_model_dir)

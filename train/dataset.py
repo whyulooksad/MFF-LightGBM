@@ -22,8 +22,11 @@ try:
         FLOWS_JSONL,
         MAX_LENGTH,
         SEED,
+        TEST_JSONL,
         TRAIN_RATIO,
+        TRAIN_JSONL,
         VAL_RATIO,
+        VAL_JSONL,
         PRETRAIN_BATCH_SIZE,
         LORA_BATCH_SIZE,
     )
@@ -33,8 +36,11 @@ except ImportError:
         FLOWS_JSONL,
         MAX_LENGTH,
         SEED,
+        TEST_JSONL,
         TRAIN_RATIO,
+        TRAIN_JSONL,
         VAL_RATIO,
+        VAL_JSONL,
         PRETRAIN_BATCH_SIZE,
         LORA_BATCH_SIZE,
     )
@@ -109,6 +115,61 @@ def load_flows(jsonl_path=None):
     return flows
 
 
+def save_flows_jsonl(flows, jsonl_path):
+    """保存流列表到JSONL。"""
+    import os
+
+    os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for flow in flows:
+            f.write(json.dumps(flow, ensure_ascii=False) + "\n")
+
+
+def split_files_exist():
+    """检查固定划分文件是否已经存在。"""
+    import os
+
+    return all(os.path.exists(p) for p in (TRAIN_JSONL, VAL_JSONL, TEST_JSONL))
+
+
+def save_splits(train, val, test):
+    """保存固定 train/val/test 划分。"""
+    save_flows_jsonl(train, TRAIN_JSONL)
+    save_flows_jsonl(val, VAL_JSONL)
+    save_flows_jsonl(test, TEST_JSONL)
+    print("已保存固定划分:")
+    print(f"  train: {TRAIN_JSONL}")
+    print(f"  val:   {VAL_JSONL}")
+    print(f"  test:  {TEST_JSONL}")
+
+
+def load_splits():
+    """读取固定 train/val/test 划分。"""
+    train = load_flows(TRAIN_JSONL)
+    val = load_flows(VAL_JSONL)
+    test = load_flows(TEST_JSONL)
+    return train, val, test
+
+
+def get_or_create_splits(flows=None, force_recreate=False):
+    """
+    获取固定划分。
+
+    如果 data/splits/train.jsonl、val.jsonl、test.jsonl 已存在，默认直接读取；
+    否则从 flows.jsonl 创建划分并保存。
+    """
+    if split_files_exist() and not force_recreate:
+        print("发现已保存的固定划分，直接读取 data/splits/*.jsonl")
+        return load_splits()
+
+    if flows is None:
+        flows = load_flows()
+
+    train, val, test = split_flows(flows)
+    save_splits(train, val, test)
+    return train, val, test
+
+
 def split_flows(flows):
     """
     划分 train / val / test。
@@ -157,7 +218,7 @@ def can_stratify(labels):
     return len(counts) > 1 and min(counts.values()) >= 2
 
 
-def create_dataloaders(flows=None, batch_size=None, for_pretrain=True):
+def create_dataloaders(flows=None, batch_size=None, for_pretrain=True, force_recreate_splits=False):
     """
     一站式函数：加载数据 → 划分 → 创建 DataLoader。
 
@@ -176,8 +237,11 @@ def create_dataloaders(flows=None, batch_size=None, for_pretrain=True):
     if batch_size is None:
         batch_size = PRETRAIN_BATCH_SIZE if for_pretrain else LORA_BATCH_SIZE
 
-    # 划分
-    train_flows, val_flows, test_flows = split_flows(flows)
+    # 划分。监督训练默认使用固定split，避免不同脚本临时划分不一致。
+    train_flows, val_flows, test_flows = get_or_create_splits(
+        flows=flows,
+        force_recreate=force_recreate_splits,
+    )
 
     # 加载 tokenizer
     print(f"加载 tokenizer from {MODEL_DIR}...")
@@ -209,7 +273,7 @@ if __name__ == "__main__":
     print("=== 测试 Dataset 加载 ===\n")
 
     # 只测加载，不划分（用全部数据快速验证）
-    flows = load_flows()  # 当前只有测试数据 2457 条
+    flows = load_flows()  # 当前只有测试数据
     train_dl, val_dl, test_dl, tokenizer = create_dataloaders(flows)
 
     # 检查一个 batch
