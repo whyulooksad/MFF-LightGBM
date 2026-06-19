@@ -14,7 +14,8 @@
         4. 保存继续预训练后的 discriminator encoder，供后续 LoRA 使用
 
 输入：
-    data/processed/flows.jsonl，每行包含一条流的 text。
+    data/processed/pretrain_flows.jsonl，每行包含一条流的 text。
+    该文件可以无label，专门作为RTD继续预训练语料。
 
 输出：
     checkpoints/pretrain/checkpoint-epoch*/ 下的 DeBERTa encoder 权重。
@@ -39,24 +40,24 @@ from transformers import (
 
 try:
     from .config import (
-        FLOWS_JSONL,
         MAX_LENGTH,
         MODEL_DIR,
         PRETRAIN_BATCH_SIZE,
         PRETRAIN_DIR,
         PRETRAIN_EPOCHS,
+        PRETRAIN_FLOWS_JSONL,
         PRETRAIN_LR,
         PRETRAIN_WARMUP,
         SEED,
     )
 except ImportError:
     from config import (
-        FLOWS_JSONL,
         MAX_LENGTH,
         MODEL_DIR,
         PRETRAIN_BATCH_SIZE,
         PRETRAIN_DIR,
         PRETRAIN_EPOCHS,
+        PRETRAIN_FLOWS_JSONL,
         PRETRAIN_LR,
         PRETRAIN_WARMUP,
         SEED,
@@ -272,7 +273,7 @@ class DebertaV3RTDPretrainer(nn.Module):
 def load_all_texts(jsonl_path=None):
     """加载全部流文本。RTD 预训练不使用 label，但打印分布方便检查数据。"""
     if jsonl_path is None:
-        jsonl_path = FLOWS_JSONL
+        jsonl_path = PRETRAIN_FLOWS_JSONL
 
     texts = []
     label_counts = {}
@@ -355,7 +356,7 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
     print("[1/5] 加载数据")
     texts = load_all_texts(jsonl_path)
     if not texts:
-        raise ValueError("没有可用于预训练的文本，请先生成 data/processed/flows.jsonl")
+        raise ValueError("没有可用于预训练的文本，请先生成 data/processed/pretrain_flows.jsonl")
 
     print("\n[2/5] 加载 tokenizer、generator、discriminator")
     tokenizer = load_tokenizer()

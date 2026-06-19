@@ -23,6 +23,9 @@ INPUT_CSV = os.path.join(INPUT_DIR, "merged_with_context_CIC-DoHBrw-2020.csv")
 # 预处理输出
 FLOWS_JSONL = os.path.join(PROCESSED_DIR, "flows.jsonl")
 
+# RTD继续预训练语料（可以无label；不要放最终监督测试集）
+PRETRAIN_FLOWS_JSONL = os.path.join(PROCESSED_DIR, "pretrain_flows.jsonl")
+
 # 特征输出
 FEATURES_PURE_CSV = os.path.join(OUTPUT_DIR, "features_pure.csv")
 FEATURES_FUSED_CSV = os.path.join(OUTPUT_DIR, "features_fused.csv")

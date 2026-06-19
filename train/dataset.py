@@ -16,16 +16,28 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from sklearn.model_selection import train_test_split
 
-from config import (
-    MODEL_DIR,
-    FLOWS_JSONL,
-    MAX_LENGTH,
-    SEED,
-    TRAIN_RATIO,
-    VAL_RATIO,
-    PRETRAIN_BATCH_SIZE,
-    LORA_BATCH_SIZE,
-)
+try:
+    from .config import (
+        MODEL_DIR,
+        FLOWS_JSONL,
+        MAX_LENGTH,
+        SEED,
+        TRAIN_RATIO,
+        VAL_RATIO,
+        PRETRAIN_BATCH_SIZE,
+        LORA_BATCH_SIZE,
+    )
+except ImportError:
+    from config import (
+        MODEL_DIR,
+        FLOWS_JSONL,
+        MAX_LENGTH,
+        SEED,
+        TRAIN_RATIO,
+        VAL_RATIO,
+        PRETRAIN_BATCH_SIZE,
+        LORA_BATCH_SIZE,
+    )
 
 
 class FlowDataset(Dataset):
@@ -106,12 +118,12 @@ def split_flows(flows):
     labels = [f["label"] for f in flows]
     unique_labels = set(labels)
 
-    # 单类别时跳过 stratify
-    if len(unique_labels) > 1:
+    # 类别样本过少时跳过 stratify，避免 train_test_split 报错
+    if can_stratify(labels):
         stratify_kwargs = {"stratify": labels}
     else:
         stratify_kwargs = {}
-        print(f"  (单类别 {unique_labels}，跳过 stratify 分层)")
+        print(f"  (类别过少或样本不足 {unique_labels}，跳过 stratify 分层)")
 
     # 先分出 test
     train_val, test = train_test_split(
@@ -123,7 +135,7 @@ def split_flows(flows):
     # 再从 train_val 里分出 val
     val_ratio_of_train_val = VAL_RATIO / (TRAIN_RATIO + VAL_RATIO)
     train_val_labels = [f["label"] for f in train_val]
-    if len(unique_labels) > 1:
+    if can_stratify(train_val_labels):
         val_stratify_kwargs = {"stratify": train_val_labels}
     else:
         val_stratify_kwargs = {}
@@ -136,6 +148,13 @@ def split_flows(flows):
 
     print(f"划分: train={len(train):,}  val={len(val):,}  test={len(test):,}")
     return train, val, test
+
+
+def can_stratify(labels):
+    counts = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    return len(counts) > 1 and min(counts.values()) >= 2
 
 
 def create_dataloaders(flows=None, batch_size=None, for_pretrain=True):
