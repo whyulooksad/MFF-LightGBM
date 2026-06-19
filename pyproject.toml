@@ -1,0 +1,31 @@
+[project]
+name = "task2-deberta"
+version = "0.1.0"
+description = "Task 2: DeBERTa-v3-base pre-training + LoRA fine-tuning for traffic feature extraction"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate",
+    "datasets",
+    "pandas",
+    "peft",
+    "protobuf>=7.35.1",
+    "scikit-learn",
+    "sentencepiece>=0.2.1",
+    "safetensors>=0.4.0",
+    "torch>=2.5.1",
+    "torchaudio>=2.5.1",
+    "torchvision>=0.20.1",
+    "tqdm",
+    "transformers",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+torchvision = { index = "pytorch-cu121" }
+torchaudio = { index = "pytorch-cu121" }

@@ -1,0 +1,37 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment & config
+.env
+.python-version
+
+# IDE
+.idea/
+
+# Model weights (too large for git)
+models/
+checkpoints/
+*.safetensors
+*.bin
+*.h5
+*.ot
+
+# Data (too large, regeneratable)
+data/
+data_example/
+*.csv
+
+# Documents & temp
+*.pdf
+~$*
+*.docx
+
+docs/
