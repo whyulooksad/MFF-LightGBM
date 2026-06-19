@@ -1,6 +1,6 @@
 """
 步骤2：PyTorch Dataset 封装
-输入：data/processed/flows.jsonl
+输入：data/processed/supervised_flows.jsonl
 输出：DataLoader（训练/验证/测试）
 
 做的事：
@@ -19,7 +19,6 @@ from sklearn.model_selection import train_test_split
 try:
     from .config import (
         MODEL_DIR,
-        FLOWS_JSONL,
         MAX_LENGTH,
         SEED,
         TEST_JSONL,
@@ -27,13 +26,12 @@ try:
         TRAIN_JSONL,
         VAL_RATIO,
         VAL_JSONL,
-        PRETRAIN_BATCH_SIZE,
+        SUPERVISED_FLOWS_JSONL,
         LORA_BATCH_SIZE,
     )
 except ImportError:
     from config import (
         MODEL_DIR,
-        FLOWS_JSONL,
         MAX_LENGTH,
         SEED,
         TEST_JSONL,
@@ -41,7 +39,7 @@ except ImportError:
         TRAIN_JSONL,
         VAL_RATIO,
         VAL_JSONL,
-        PRETRAIN_BATCH_SIZE,
+        SUPERVISED_FLOWS_JSONL,
         LORA_BATCH_SIZE,
     )
 
@@ -75,6 +73,8 @@ class FlowDataset(Dataset):
             )
             self.input_ids.append(encoded["input_ids"].squeeze(0))
             self.attention_mask.append(encoded["attention_mask"].squeeze(0))
+            if flow.get("label") is None:
+                raise ValueError("FlowDataset requires label; use supervised_flows.jsonl for LoRA training")
             self.labels.append(flow["label"])
 
         # 转成大 Tensor，比逐条取快
@@ -96,7 +96,7 @@ class FlowDataset(Dataset):
 def load_flows(jsonl_path=None):
     """从 JSONL 加载所有流。"""
     if jsonl_path is None:
-        jsonl_path = FLOWS_JSONL
+        jsonl_path = SUPERVISED_FLOWS_JSONL
 
     flows = []
     with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -108,7 +108,7 @@ def load_flows(jsonl_path=None):
     # 统计
     labels = {}
     for f in flows:
-        lbl = f["label"]
+        lbl = f.get("label")
         labels[lbl] = labels.get(lbl, 0) + 1
     print(f"  label 分布: {labels}")
 
@@ -156,7 +156,7 @@ def get_or_create_splits(flows=None, force_recreate=False):
     获取固定划分。
 
     如果 data/splits/train.jsonl、val.jsonl、test.jsonl 已存在，默认直接读取；
-    否则从 flows.jsonl 创建划分并保存。
+    否则从 supervised_flows.jsonl 创建划分并保存。
     """
     if split_files_exist() and not force_recreate:
         print("发现已保存的固定划分，直接读取 data/splits/*.jsonl")
@@ -218,24 +218,22 @@ def can_stratify(labels):
     return len(counts) > 1 and min(counts.values()) >= 2
 
 
-def create_dataloaders(flows=None, batch_size=None, for_pretrain=True, force_recreate_splits=False):
+def create_dataloaders(flows=None, batch_size=None, force_recreate_splits=False):
     """
     一站式函数：加载数据 → 划分 → 创建 DataLoader。
 
     参数:
         flows: 流列表，None 则从 JSONL 读取
         batch_size: 批次大小，None 则用 config 默认值
-        for_pretrain: True=预训练用(不需要label), False=微调用(需要label)
 
     返回:
-        如果 for_pretrain: train_dl, val_dl, test_dl, tokenizer
-        如果 for_pretrain=False: train_dl, val_dl, test_dl, tokenizer
+        train_dl, val_dl, test_dl, tokenizer
     """
     if flows is None:
         flows = load_flows()
 
     if batch_size is None:
-        batch_size = PRETRAIN_BATCH_SIZE if for_pretrain else LORA_BATCH_SIZE
+        batch_size = LORA_BATCH_SIZE
 
     # 划分。监督训练默认使用固定split，避免不同脚本临时划分不一致。
     train_flows, val_flows, test_flows = get_or_create_splits(

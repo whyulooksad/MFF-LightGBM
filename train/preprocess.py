@@ -2,8 +2,9 @@
 步骤1：数据预处理
 输入：任务一的 CSV 文件
 输出：
-    data/processed/pretrain_flows.jsonl（RTD继续预训练语料，可以无label）
-    data/processed/flows.jsonl（有标签监督训练/特征提取数据）
+    data/processed/pretrain_flows.jsonl（pretrain_flows.csv 预处理结果）
+    data/processed/supervised_flows.jsonl（supervised_flows.csv 预处理结果）
+    data/processed/feature_flows.jsonl（feature_flows.csv 预处理结果）
 
 核心逻辑：
 1. 按五元组归组（双向合并）
@@ -23,24 +24,28 @@ from tqdm import tqdm
 try:
     from .config import (
         EXAMPLE_CSV,
-        FLOWS_JSONL,
+        FEATURE_FLOWS_JSONL,
+        FEATURE_INPUT_CSV,
         INPUT_CSV,
         NUM_FEATURES,
         PRETRAIN_FLOWS_JSONL,
         PRETRAIN_INPUT_CSV,
         SSL_FIELDS,
+        SUPERVISED_FLOWS_JSONL,
         SUPERVISED_INPUT_CSV,
         X509_FIELDS,
     )
 except ImportError:
     from config import (
         EXAMPLE_CSV,
-        FLOWS_JSONL,
+        FEATURE_FLOWS_JSONL,
+        FEATURE_INPUT_CSV,
         INPUT_CSV,
         NUM_FEATURES,
         PRETRAIN_FLOWS_JSONL,
         PRETRAIN_INPUT_CSV,
         SSL_FIELDS,
+        SUPERVISED_FLOWS_JSONL,
         SUPERVISED_INPUT_CSV,
         X509_FIELDS,
     )
@@ -200,14 +205,20 @@ def extract_num_features(summary_json_str) -> dict:
 # 主流程
 # ============================================================
 
-def resolve_default_csv(for_pretrain=False):
+def resolve_default_csv(target="supervised"):
     """按用途选择默认CSV路径。"""
     import os
 
-    if for_pretrain:
+    if target == "pretrain":
         if os.path.exists(PRETRAIN_INPUT_CSV):
             return PRETRAIN_INPUT_CSV
         print(f"[INFO] 预训练CSV不存在 ({PRETRAIN_INPUT_CSV})，使用样例数据")
+        return EXAMPLE_CSV
+
+    if target == "feature":
+        if os.path.exists(FEATURE_INPUT_CSV):
+            return FEATURE_INPUT_CSV
+        print(f"[INFO] 特征提取CSV不存在({FEATURE_INPUT_CSV})，使用样例数据")
         return EXAMPLE_CSV
 
     if os.path.exists(SUPERVISED_INPUT_CSV):
@@ -222,22 +233,27 @@ def preprocess(
     csv_path: str = None,
     output_path: str = None,
     nrows: int = None,
-    for_pretrain: bool = False,
+    target: str = "supervised",
 ):
     """
     主预处理函数。
 
     参数:
-        csv_path: 输入 CSV 路径，默认按 for_pretrain 选择 data/input 下的CSV
+        csv_path: 输入 CSV 路径，默认按 target 选择 data/input 下的CSV
         output_path: 输出 JSONL 路径，默认用 config 中的路径
         nrows: 只读前 nrows 行（测试用，None=全读）
-        for_pretrain: True=生成 pretrain_flows.jsonl，False=生成 flows.jsonl
+        target: pretrain/supervised/feature
     """
     if csv_path is None:
-        csv_path = resolve_default_csv(for_pretrain=for_pretrain)
+        csv_path = resolve_default_csv(target=target)
 
     if output_path is None:
-        output_path = PRETRAIN_FLOWS_JSONL if for_pretrain else FLOWS_JSONL
+        output_paths = {
+            "pretrain": PRETRAIN_FLOWS_JSONL,
+            "supervised": SUPERVISED_FLOWS_JSONL,
+            "feature": FEATURE_FLOWS_JSONL,
+        }
+        output_path = output_paths[target]
 
     print(f"[1/5] 读取 CSV: {csv_path}")
     if nrows:
@@ -355,12 +371,12 @@ def preprocess(
 
 
 def preprocess_supervised(csv_path: str = None, output_path: str = None, nrows: int = None):
-    """生成有标签监督训练/特征提取数据：data/processed/flows.jsonl。"""
+    """生成LoRA监督训练数据：data/processed/supervised_flows.jsonl。"""
     return preprocess(
         csv_path=csv_path,
-        output_path=output_path or FLOWS_JSONL,
+        output_path=output_path or SUPERVISED_FLOWS_JSONL,
         nrows=nrows,
-        for_pretrain=False,
+        target="supervised",
     )
 
 
@@ -370,17 +386,29 @@ def preprocess_pretrain(csv_path: str = None, output_path: str = None, nrows: in
         csv_path=csv_path,
         output_path=output_path or PRETRAIN_FLOWS_JSONL,
         nrows=nrows,
-        for_pretrain=True,
+        target="pretrain",
+    )
+
+
+def preprocess_feature(csv_path: str = None, output_path: str = None, nrows: int = None):
+    """生成最终特征提取数据：data/processed/feature_flows.jsonl。"""
+    return preprocess(
+        csv_path=csv_path,
+        output_path=output_path or FEATURE_FLOWS_JSONL,
+        nrows=nrows,
+        target="feature",
     )
 
 
 def preprocess_all(nrows: int = None):
-    """按约定同时生成 pretrain_flows.jsonl 和 flows.jsonl。"""
+    """按约定同时生成 pretrain/supervised/feature 三份JSONL。"""
     print("=== 生成RTD继续预训练语料 ===")
     pretrain_flows = preprocess_pretrain(nrows=nrows)
-    print("\n=== 生成有标签监督训练/特征提取数据 ===")
+    print("\n=== 生成LoRA监督训练数据 ===")
     supervised_flows = preprocess_supervised(nrows=nrows)
-    return pretrain_flows, supervised_flows
+    print("\n=== 生成最终特征提取数据 ===")
+    feature_flows = preprocess_feature(nrows=nrows)
+    return pretrain_flows, supervised_flows, feature_flows
 
 
 # ============================================================
@@ -392,7 +420,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="预处理CSV并生成任务二JSONL数据")
     parser.add_argument(
         "--target",
-        choices=["all", "pretrain", "supervised"],
+        choices=["all", "pretrain", "supervised", "feature"],
         default="all",
         help="要生成的数据集类型，默认all",
     )
@@ -408,5 +436,7 @@ if __name__ == "__main__":
         preprocess_pretrain(nrows=args.nrows)
     elif args.target == "supervised":
         preprocess_supervised(nrows=args.nrows)
+    elif args.target == "feature":
+        preprocess_feature(nrows=args.nrows)
     else:
         preprocess_all(nrows=args.nrows)

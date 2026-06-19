@@ -21,19 +21,20 @@ SPLIT_DIR = os.path.join(DATA_DIR, "splits")
 EXAMPLE_CSV = os.path.join(ROOT, "data_example", "merged_with_context_CIC-DoHBrw-2020.csv")
 
 # 正式输入CSV
-#   supervised_flows.csv: 有标签数据，用于LoRA分类训练和特征提取
-#   pretrain_flows.csv:  预训练语料，可以无label，不应包含最终监督测试集
+#   pretrain_flows.csv:   给RTD继续预训练，可以无label
+#   supervised_flows.csv: 给LoRA分类器监督训练
+#   feature_flows.csv:    欧鲁金任务一产出，给最终特征提取
 SUPERVISED_INPUT_CSV = os.path.join(INPUT_DIR, "supervised_flows.csv")
 PRETRAIN_INPUT_CSV = os.path.join(INPUT_DIR, "pretrain_flows.csv")
+FEATURE_INPUT_CSV = os.path.join(INPUT_DIR, "feature_flows.csv")
 
-# 兼容旧文件名：如果 supervised_flows.csv 不存在，会回退到这个路径
+# 兼容早期样例输入：如果 supervised_flows.csv 不存在，会回退到这个路径
 INPUT_CSV = os.path.join(INPUT_DIR, "merged_with_context_CIC-DoHBrw-2020.csv")
 
 # 预处理输出
-FLOWS_JSONL = os.path.join(PROCESSED_DIR, "flows.jsonl")
-
-# RTD继续预训练语料（可以无label；不要放最终监督测试集）
 PRETRAIN_FLOWS_JSONL = os.path.join(PROCESSED_DIR, "pretrain_flows.jsonl")
+SUPERVISED_FLOWS_JSONL = os.path.join(PROCESSED_DIR, "supervised_flows.jsonl")
+FEATURE_FLOWS_JSONL = os.path.join(PROCESSED_DIR, "feature_flows.jsonl")
 
 # 固定监督训练划分
 TRAIN_JSONL = os.path.join(SPLIT_DIR, "train.jsonl")
@@ -55,12 +56,11 @@ LORA_DIR = os.path.join(CHECKPOINT_DIR, "lora")
 # ============================================================
 MAX_LENGTH = 512          # DeBERTa 最大序列长度
 
-# SimCSE 预训练
-PRETRAIN_BATCH_SIZE = 8   # SimCSE 受益于大 batch（更多负样本），显存允许可调到 16/32
+# RTD continued pretraining
+PRETRAIN_BATCH_SIZE = 8
 PRETRAIN_EPOCHS = 3
-PRETRAIN_LR = 3e-5        # SimCSE 标准学习率
+PRETRAIN_LR = 3e-5
 PRETRAIN_WARMUP = 1000
-SIMCSE_TEMPERATURE = 0.05  # 对比 loss 温度系数
 
 # LoRA 微调
 LORA_BATCH_SIZE = 16
