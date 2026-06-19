@@ -9,6 +9,16 @@
   - 随机遮住 15% 的 token
   - 让模型预测被遮住的是什么
   - 反复几轮后，模型学会了流量序列的"语法"
+
+===== 关于 MLM 头加载 =====
+
+DeBERTa-v3 的 MLM 预测头 key 名与 AutoModelForMaskedLM 期望不一致。
+通过手动映射 5 个同 shape key 加载 transform 部分权重，
+decoder 权重与 embedding 绑定自动复用。
+decoder.bias（128100维）是 token 先验，在 checkpoint 中不存在，
+且 ELECTRA 源域的 token 分布不适用于加密流量文本，置零从数据中学。
+
+加载流程：手动映射 5 key → decoder.bias 置零 → cls.predictions.bias 置零。
 """
 
 import os
@@ -35,6 +45,39 @@ from config import (
     PRETRAIN_WARMUP,
     SEED,
 )
+
+
+def _remap_mlm_head(model, model_dir):
+    """手动映射 DeBERTa-v3 MLM 预测头：checkpoint key → transformers 期望的 key。"""
+    import os as _os
+    sf_path = _os.path.join(model_dir, "model.safetensors")
+    bin_path = _os.path.join(model_dir, "pytorch_model.bin")
+    if _os.path.exists(sf_path):
+        from safetensors.torch import load_file
+        raw = load_file(sf_path)
+    else:
+        raw = torch.load(bin_path, map_location="cpu", weights_only=True)
+
+    ckpt = model.state_dict()
+    mapping = [
+        ("lm_predictions.lm_head.dense.weight",       "cls.predictions.transform.dense.weight"),
+        ("lm_predictions.lm_head.dense.bias",         "cls.predictions.transform.dense.bias"),
+        ("lm_predictions.lm_head.LayerNorm.weight",   "cls.predictions.transform.LayerNorm.weight"),
+        ("lm_predictions.lm_head.LayerNorm.bias",     "cls.predictions.transform.LayerNorm.bias"),
+        ("lm_predictions.lm_head.bias",               "cls.predictions.bias"),
+    ]
+    loaded = 0
+    for ckpt_key, model_key in mapping:
+        if ckpt_key in raw and model_key in ckpt:
+            ckpt[model_key] = raw[ckpt_key]
+            loaded += 1
+
+    # ELECTRA 预训练的 bias 不适用本领域文本分布，置零从头学
+    ckpt["cls.predictions.bias"].zero_()
+    ckpt["cls.predictions.decoder.bias"].zero_()
+
+    model.load_state_dict(ckpt)
+    print(f"  MLM 头映射: {loaded}/{len(mapping)} 个 key，bias 已置零")
 
 
 def load_all_texts(jsonl_path=None):
@@ -82,8 +125,11 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
     print("\n[2/5] 加载 tokenizer & 模型")
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    # 模型加载：DeBERTa-v3 的 MLM 头 key 名与 transformers 期望不一致
+    # lm_predictions.lm_head.* → cls.predictions.transform.* (shape 相同，手动映射)
+    # decoder 与 embedding 绑定，自动复用
     model = AutoModelForMaskedLM.from_pretrained(MODEL_DIR)
-
+    _remap_mlm_head(model, MODEL_DIR)
     print(f"  模型参数量: {sum(p.numel() for p in model.parameters()):,}")
 
     # ========================================
@@ -162,6 +208,7 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
             loss = outputs.loss
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 防梯度爆炸
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()

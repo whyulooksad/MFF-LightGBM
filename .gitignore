@@ -35,3 +35,5 @@ data_example/
 *.docx
 
 docs/
+memory/
+hf_cache/

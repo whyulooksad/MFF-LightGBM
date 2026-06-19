@@ -42,8 +42,8 @@ MLM_PROB = 0.15           # MLM 掩码比例
 # 预训练
 PRETRAIN_BATCH_SIZE = 8
 PRETRAIN_EPOCHS = 3
-PRETRAIN_LR = 5e-5
-PRETRAIN_WARMUP = 500
+PRETRAIN_LR = 5e-6  # ELECTRA bias 置零后从零学，需要更小步长
+PRETRAIN_WARMUP = 2000  # 加长 warmup，平稳过渡
 
 # LoRA 微调
 LORA_BATCH_SIZE = 16
