@@ -16,13 +16,6 @@ wheels/
 # IDE
 .idea/
 
-# Model weights (too large for git)
-models/
-checkpoints/
-*.safetensors
-*.bin
-*.h5
-*.ot
 
 # Data (too large, regeneratable)
 data/

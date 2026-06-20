@@ -47,6 +47,7 @@ try:
         PRETRAIN_EPOCHS,
         PRETRAIN_FLOWS_JSONL,
         PRETRAIN_LR,
+        PRETRAIN_MAX_LENGTH,
         PRETRAIN_WARMUP,
         SEED,
     )
@@ -59,6 +60,7 @@ except ImportError:
         PRETRAIN_EPOCHS,
         PRETRAIN_FLOWS_JSONL,
         PRETRAIN_LR,
+        PRETRAIN_MAX_LENGTH,
         PRETRAIN_WARMUP,
         SEED,
     )
@@ -111,8 +113,9 @@ class FlowTextDataset(Dataset):
 
 class RTDHead(nn.Module):
     """
-    DeBERTa 官方 RTD head 的简化等价实现：
-    CLS 上下文状态与每个 token 状态相加后做 token-level 二分类。
+    Port of DeBERTa's RTD prediction head structure.
+    Official LMMaskPredictionHead uses CLS context + token state, then
+    LayerNorm -> dense -> activation -> token-level binary classifier.
     """
 
     def __init__(self, config):
@@ -369,7 +372,7 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
     print(f"  参数量: {sum(p.numel() for p in model.parameters()):,}")
 
     print("\n[3/5] 分词 & 准备 DataLoader")
-    dataset = FlowTextDataset(texts, tokenizer, MAX_LENGTH)
+    dataset = FlowTextDataset(texts, tokenizer, PRETRAIN_MAX_LENGTH)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -380,7 +383,8 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
 
     print("\n[4/5] 开始 RTD 继续预训练")
     print(
-        f"  epochs={epochs}, lr={lr}, warmup={PRETRAIN_WARMUP}, "
+        f"  epochs={epochs}, batch_size={batch_size}, max_length={PRETRAIN_MAX_LENGTH}, "
+        f"lr={lr}, warmup={PRETRAIN_WARMUP}, "
         f"mlm_prob={MLM_PROBABILITY}, disc_weight={DISCRIMINATOR_LOSS_WEIGHT}"
     )
 
