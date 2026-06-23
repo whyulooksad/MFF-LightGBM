@@ -37,6 +37,9 @@ try:
         LORA_TARGET_MODULES,
         MAX_LENGTH,
         MODEL_DIR,
+        NUM_LABELS,
+        ID2LABEL,
+        LABEL2ID,
         PRETRAIN_DIR,
         SEED,
     )
@@ -53,14 +56,13 @@ except ImportError:
         LORA_TARGET_MODULES,
         MAX_LENGTH,
         MODEL_DIR,
+        NUM_LABELS,
+        ID2LABEL,
+        LABEL2ID,
         PRETRAIN_DIR,
         SEED,
     )
     from dataset import FlowDataset, get_or_create_splits, load_flows
-
-
-NUM_LABELS = 2
-
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -96,6 +98,8 @@ def build_model(base_model_dir):
         base_model_dir,
         num_labels=NUM_LABELS,
         problem_type="single_label_classification",
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
     )
 
     peft_config = LoraConfig(
@@ -145,7 +149,7 @@ def evaluate(model, dataloader, device):
     precision, recall, f1, _ = precision_recall_fscore_support(
         labels,
         preds,
-        average="binary",
+        average="macro",
         zero_division=0,
     )
     return {

@@ -34,7 +34,10 @@ try:
         LORA_DIR,
         MAX_LENGTH,
         MODEL_DIR,
-        NUM_FEATURES,
+        NEW_FORMAT_NUM_FEATURES,
+        NUM_LABELS,
+        ID2LABEL,
+        LABEL2ID,
         OUTPUT_DIR,
         PRETRAIN_DIR,
     )
@@ -48,7 +51,10 @@ except ImportError:
         LORA_DIR,
         MAX_LENGTH,
         MODEL_DIR,
-        NUM_FEATURES,
+        NEW_FORMAT_NUM_FEATURES,
+        NUM_LABELS,
+        ID2LABEL,
+        LABEL2ID,
         OUTPUT_DIR,
         PRETRAIN_DIR,
     )
@@ -104,7 +110,12 @@ def build_model(base_model_dir=None, adapter_dir=None):
         )
 
     print(f"  base_model_dir={base_model_dir}")
-    model = AutoModelForSequenceClassification.from_pretrained(base_model_dir, num_labels=2)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        base_model_dir,
+        num_labels=NUM_LABELS,
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
+    )
     print(f"  adapter_dir={adapter_dir}")
     model = PeftModel.from_pretrained(model, adapter_dir)
     model.float()
@@ -179,11 +190,11 @@ def write_feature_csv(flows, features, output_path, fused=False):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     feat_cols = [f"feat_{i}" for i in range(FEATURE_DIM)]
-    num_cols = [col_name for _, col_name in NUM_FEATURES]
+    num_cols = list(NEW_FORMAT_NUM_FEATURES)
     fieldnames = ["flow_id"] + feat_cols
     if fused:
         fieldnames += num_cols
-    fieldnames += ["label"]
+    fieldnames += ["label", "label_name"]
 
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -193,6 +204,7 @@ def write_feature_csv(flows, features, output_path, fused=False):
             row = {
                 "flow_id": flow.get("flow_id", ""),
                 "label": flow.get("label"),
+                "label_name": flow.get("label_name", ""),
             }
             for idx, value in enumerate(vector):
                 row[f"feat_{idx}"] = value

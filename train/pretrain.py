@@ -111,6 +111,31 @@ class FlowTextDataset(Dataset):
         }
 
 
+class LazyFlowTextDataset(Dataset):
+    """Text dataset for RTD pretraining with lazy tokenization."""
+
+    def __init__(self, texts, tokenizer, max_length=MAX_LENGTH):
+        self.texts = list(texts)
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        encoded = self.tokenizer(
+            self.texts[idx],
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": encoded["input_ids"].squeeze(0),
+            "attention_mask": encoded["attention_mask"].squeeze(0),
+        }
+
+
 class RTDHead(nn.Module):
     """
     Port of DeBERTa's RTD prediction head structure.
@@ -372,7 +397,7 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
     print(f"  参数量: {sum(p.numel() for p in model.parameters()):,}")
 
     print("\n[3/5] 分词 & 准备 DataLoader")
-    dataset = FlowTextDataset(texts, tokenizer, PRETRAIN_MAX_LENGTH)
+    dataset = LazyFlowTextDataset(texts, tokenizer, PRETRAIN_MAX_LENGTH)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,

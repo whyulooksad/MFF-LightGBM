@@ -1,249 +1,247 @@
 """
-步骤1：数据预处理
-输入：任务一的 CSV 文件
-输出：
-    data/processed/pretrain_flows.jsonl（pretrain_flows.csv 预处理结果）
-    data/processed/supervised_flows.jsonl（supervised_flows.csv 预处理结果）
-    data/processed/feature_flows.jsonl（feature_flows.csv 预处理结果）
+Step 1: preprocess task-1 multiclass flow CSV.
 
-核心逻辑：
-1. 按五元组归组（双向合并）
-2. 组内按时间排序
-3. 从 context_text 中提取 SSL/X509 事件，压缩成紧凑 JSON
-4. 拼接为流文本序列
-5. 从 summary_json 提取数值特征
-6. 输出 JSONL
+Input format:
+    final_multiclass_features.csv style rows with:
+    flow_uid, five-tuple fields, label, flat numeric features,
+    zeek_conn_log, zeek_ssl_log, zeek_x509_log.
+
+Outputs:
+    data/processed/pretrain_flows.jsonl
+    data/processed/supervised_flows.jsonl
+    data/processed/feature_flows.jsonl
+
+Leakage/source columns such as dataset_source, subfolder, and pcap_filename are
+not used in model text or fused numeric features.
 """
 
+from __future__ import annotations
+
+import ast
 import json
+import math
+import os
+from collections import Counter
+from pathlib import Path
+
 import pandas as pd
-from json.decoder import JSONDecoder
-from collections import defaultdict
 from tqdm import tqdm
 
 try:
     from .config import (
-        EXAMPLE_CSV,
         FEATURE_FLOWS_JSONL,
         FEATURE_INPUT_CSV,
-        INPUT_CSV,
-        NUM_FEATURES,
+        LABEL2ID,
+        NEW_FORMAT_NUM_FEATURES,
         PRETRAIN_FLOWS_JSONL,
         PRETRAIN_INPUT_CSV,
-        SSL_FIELDS,
+        ROOT,
         SUPERVISED_FLOWS_JSONL,
         SUPERVISED_INPUT_CSV,
-        X509_FIELDS,
     )
 except ImportError:
     from config import (
-        EXAMPLE_CSV,
         FEATURE_FLOWS_JSONL,
         FEATURE_INPUT_CSV,
-        INPUT_CSV,
-        NUM_FEATURES,
+        LABEL2ID,
+        NEW_FORMAT_NUM_FEATURES,
         PRETRAIN_FLOWS_JSONL,
         PRETRAIN_INPUT_CSV,
-        SSL_FIELDS,
+        ROOT,
         SUPERVISED_FLOWS_JSONL,
         SUPERVISED_INPUT_CSV,
-        X509_FIELDS,
     )
 
 
-# ============================================================
-# 工具函数
-# ============================================================
+REQUIRED_COLUMNS = {
+    "flow_uid",
+    "src_ip",
+    "src_port",
+    "dst_ip",
+    "dst_port",
+    "protocol",
+    "timestamp",
+    "label",
+    "zeek_conn_log",
+    "zeek_ssl_log",
+    "zeek_x509_log",
+}
 
-def canonical_flow_id(row):
-    """
-    计算与方向无关的流 ID。
-    (A:pa → B:pb) 和 (B:pb → A:pa) 会得到同一个 ID。
-    """
-    ip_a, port_a = str(row["src_ip"]), int(row["src_port"])
-    ip_b, port_b = str(row["dst_ip"]), int(row["dst_port"])
-    proto = str(row["protocol"])
+CONN_FIELDS = {
+    "proto": "proto",
+    "service": "svc",
+    "duration": "dur",
+    "orig_bytes": "orig_bytes",
+    "resp_bytes": "resp_bytes",
+    "conn_state": "state",
+    "missed_bytes": "missed",
+    "history": "hist",
+    "orig_pkts": "orig_pkts",
+    "resp_pkts": "resp_pkts",
+}
 
-    if (ip_a, port_a) < (ip_b, port_b):
-        return f"{ip_a}_{port_a}_{ip_b}_{port_b}_{proto}"
-    else:
-        return f"{ip_b}_{port_b}_{ip_a}_{port_a}_{proto}"
+SSL_FIELDS = {
+    "version": "ver",
+    "cipher": "cipher",
+    "curve": "curve",
+    "server_name": "sni",
+    "resumed": "resumed",
+    "last_alert": "alert",
+    "next_protocol": "next",
+    "established": "est",
+    "subject": "subj",
+    "issuer": "issuer",
+    "validation_status": "validation",
+}
 
-
-def parse_context_text(text: str) -> list[dict]:
-    """
-    从 context_text 单元格中解析出所有事件。
-
-    context_text 格式（pandas 读取后，引号已转义回正常形式）：
-        [SSL] {"ts": 123, "version": "TLSv12", ...}
-        [X509] {"ts": 456, "certificate.subject": "CN=...", ...}
-
-    一个单元格可能包含多个事件（用换行分隔），也可能只包含一个。
-
-    返回: [{"type": "ssl", "data": {...}}, {"type": "x509", "data": {...}}, ...]
-    """
-    events = []
-    decoder = JSONDecoder()
-    pos = 0
-
-    while pos < len(text):
-        # 找到下一个 [SSL] 或 [X509] 标记
-        ssl_pos = text.find("[SSL] ", pos)
-        x509_pos = text.find("[X509] ", pos)
-
-        if ssl_pos == -1 and x509_pos == -1:
-            break
-
-        # 取更靠前的那一个
-        if ssl_pos == -1:
-            start = x509_pos
-            event_type = "x509"
-            json_start = start + 7  # len("[X509] ")
-        elif x509_pos == -1:
-            start = ssl_pos
-            event_type = "ssl"
-            json_start = start + 6  # len("[SSL] ")
-        elif ssl_pos < x509_pos:
-            start = ssl_pos
-            event_type = "ssl"
-            json_start = start + 6
-        else:
-            start = x509_pos
-            event_type = "x509"
-            json_start = start + 7
-
-        # 用 JSONDecoder.raw_decode 精确解析（自动处理嵌套大括号）
-        try:
-            obj, end_idx = decoder.raw_decode(text[json_start:])
-            events.append({"type": event_type, "data": obj})
-            pos = json_start + end_idx
-        except json.JSONDecodeError:
-            # 解析失败则跳过这个字符继续
-            pos = json_start + 1
-
-    return events
+X509_FIELDS = {
+    "certificate.version": "ver",
+    "certificate.subject": "subj",
+    "certificate.issuer": "issuer",
+    "certificate.not_valid_before": "not_bef",
+    "certificate.not_valid_after": "not_aft",
+    "certificate.key_alg": "key_alg",
+    "certificate.sig_alg": "sig",
+    "certificate.key_type": "key_type",
+    "certificate.key_length": "key_len",
+    "certificate.curve": "curve",
+    "san.dns": "san_dns",
+    "basic_constraints.ca": "ca",
+}
 
 
-def compact_ssl_event(data: dict) -> dict:
-    """将 SSL 事件压缩为只含关键字段的紧凑 dict。"""
-    out = {"t": "s"}  # type 缩写
-    for src_key, dst_key in SSL_FIELDS.items():
-        if src_key in data and data[src_key] is not None:
-            val = data[src_key]
-            if isinstance(val, bool):
-                val = 1 if val else 0
-            elif isinstance(val, str):
-                # 去掉字符串里可能混淆解析的字符
-                val = val.replace('"', "'").replace("\n", " ").strip()
-            out[dst_key] = val
-    return out
+def resolve_default_csv(target: str = "supervised") -> str:
+    target_paths = {
+        "pretrain": PRETRAIN_INPUT_CSV,
+        "supervised": SUPERVISED_INPUT_CSV,
+        "feature": FEATURE_INPUT_CSV,
+    }
+    preferred = target_paths[target]
+    if os.path.exists(preferred):
+        return preferred
+
+    root_csv = os.path.join(ROOT, "final_multiclass_features.csv")
+    if os.path.exists(root_csv):
+        print(f"[INFO] {preferred} not found; using {root_csv}")
+        return root_csv
+
+    raise FileNotFoundError(
+        f"Missing input CSV for target={target}. Expected {preferred} "
+        f"or {root_csv}."
+    )
 
 
-def compact_x509_event(data: dict) -> dict:
-    """将 X509 事件压缩为只含关键字段的紧凑 dict。"""
-    out = {"t": "x"}
-    for src_key, dst_key in X509_FIELDS.items():
-        if src_key in data and data[src_key] is not None:
-            val = data[src_key]
-            if isinstance(val, str):
-                val = val.replace('"', "'").replace("\n", " ").strip()
-            out[dst_key] = val
-    return out
+def clean_value(value):
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if value in {"", "-", "nan", "NaN", "None", "null"}:
+            return None
+        return value.replace('"', "'").replace("\n", " ")
+    return value
 
 
-def compact_event(event: dict) -> str:
-    """将一个事件（ssl 或 x509）转成紧凑的 JSON 字符串。"""
-    if event["type"] == "ssl":
-        compact = compact_ssl_event(event["data"])
-    else:
-        compact = compact_x509_event(event["data"])
-    # separators 去掉冒号和逗号后的空格，最紧凑
-    return json.dumps(compact, separators=(",", ":"), ensure_ascii=False)
-
-
-def build_flow_text(events: list[dict]) -> str:
-    """把一条流的所有事件拼接成文本。[CLS]/[SEP] 由 tokenizer 自动加。"""
-    parts = []
-    for ev in events:
-        parts.append(compact_event(ev))
-    return " ".join(parts)
-
-
-def extract_num_features(summary_json_str) -> dict:
-    """从 summary_json 字符串中提取数值特征。"""
-    features = {}
-    if pd.isna(summary_json_str) or not summary_json_str:
-        return features
-
+def parse_literal_cell(value):
+    value = clean_value(value)
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
     try:
-        data = json.loads(summary_json_str)
-    except (json.JSONDecodeError, TypeError):
-        return features
+        return ast.literal_eval(str(value))
+    except (SyntaxError, ValueError):
+        return None
 
-    for path_parts, col_name in NUM_FEATURES:
-        # 沿着路径深入到嵌套 JSON 中取值
-        val = data
-        for key in path_parts:
-            if isinstance(val, dict) and key in val:
-                val = val[key]
-            else:
-                val = None
-                break
-        # 处理取值
+
+def compact_dict(data: dict, field_map: dict, event_type: str) -> dict:
+    out = {"t": event_type}
+    if not isinstance(data, dict):
+        return out
+    for src, dst in field_map.items():
+        val = clean_value(data.get(src))
         if val is None:
-            features[col_name] = None
-        elif isinstance(val, bool):
-            features[col_name] = 1 if val else 0
-        elif isinstance(val, (int, float)):
-            features[col_name] = val
-        else:
-            features[col_name] = None
-    return features
+            continue
+        out[dst] = val
+    return out
 
 
-# ============================================================
-# 主流程
-# ============================================================
+def compact_json(data: dict) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
-def resolve_default_csv(target="supervised"):
-    """按用途选择默认CSV路径。"""
-    import os
 
-    if target == "pretrain":
-        if os.path.exists(PRETRAIN_INPUT_CSV):
-            return PRETRAIN_INPUT_CSV
-        print(f"[INFO] 预训练CSV不存在 ({PRETRAIN_INPUT_CSV})，使用样例数据")
-        return EXAMPLE_CSV
+def build_flow_text(row: pd.Series) -> tuple[str, int]:
+    parts = []
 
-    if target == "feature":
-        if os.path.exists(FEATURE_INPUT_CSV):
-            return FEATURE_INPUT_CSV
-        print(f"[INFO] 特征提取CSV不存在({FEATURE_INPUT_CSV})，使用样例数据")
-        return EXAMPLE_CSV
+    conn = parse_literal_cell(row.get("zeek_conn_log"))
+    if isinstance(conn, dict):
+        parts.append(compact_json(compact_dict(conn, CONN_FIELDS, "c")))
 
-    if os.path.exists(SUPERVISED_INPUT_CSV):
-        return SUPERVISED_INPUT_CSV
-    if os.path.exists(INPUT_CSV):
-        return INPUT_CSV
-    print(f"[INFO] 监督CSV不存在 ({SUPERVISED_INPUT_CSV} / {INPUT_CSV})，使用样例数据")
-    return EXAMPLE_CSV
+    ssl = parse_literal_cell(row.get("zeek_ssl_log"))
+    if isinstance(ssl, dict):
+        parts.append(compact_json(compact_dict(ssl, SSL_FIELDS, "s")))
+
+    x509 = parse_literal_cell(row.get("zeek_x509_log"))
+    if isinstance(x509, dict):
+        x509 = [x509]
+    if isinstance(x509, list):
+        for cert in x509:
+            if isinstance(cert, dict):
+                parts.append(compact_json(compact_dict(cert, X509_FIELDS, "x")))
+
+    return " ".join(parts), len(parts)
+
+
+def parse_label(label_value) -> tuple[int | None, str | None]:
+    label_name = clean_value(label_value)
+    if label_name is None:
+        return None, None
+    label_name = str(label_name).lower()
+    if label_name not in LABEL2ID:
+        raise ValueError(f"Unknown label: {label_value!r}. Expected one of {sorted(LABEL2ID)}")
+    return LABEL2ID[label_name], label_name
+
+
+def parse_numeric(value):
+    value = clean_value(value)
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
+
+
+def extract_num_features(row: pd.Series) -> dict:
+    return {col: parse_numeric(row.get(col)) for col in NEW_FORMAT_NUM_FEATURES}
+
+
+def canonical_flow_id(row: pd.Series) -> str:
+    if clean_value(row.get("flow_uid")) is not None:
+        return str(row["flow_uid"])
+    src_port = int(float(row["src_port"]))
+    dst_port = int(float(row["dst_port"]))
+    proto = str(row["protocol"]).lower()
+    return f"{row['src_ip']}_{src_port}_{row['dst_ip']}_{dst_port}_{proto}_{row['timestamp']}"
+
+
+def validate_columns(df: pd.DataFrame):
+    missing = sorted(REQUIRED_COLUMNS - set(df.columns))
+    if missing:
+        raise ValueError(f"Input CSV missing required columns: {missing}")
 
 
 def preprocess(
-    csv_path: str = None,
-    output_path: str = None,
-    nrows: int = None,
+    csv_path: str | None = None,
+    output_path: str | None = None,
+    nrows: int | None = None,
     target: str = "supervised",
 ):
-    """
-    主预处理函数。
-
-    参数:
-        csv_path: 输入 CSV 路径，默认按 target 选择 data/input 下的CSV
-        output_path: 输出 JSONL 路径，默认用 config 中的路径
-        nrows: 只读前 nrows 行（测试用，None=全读）
-        target: pretrain/supervised/feature
-    """
     if csv_path is None:
         csv_path = resolve_default_csv(target=target)
 
@@ -255,188 +253,104 @@ def preprocess(
         }
         output_path = output_paths[target]
 
-    print(f"[1/5] 读取 CSV: {csv_path}")
+    print(f"[1/4] Read CSV: {csv_path}")
     if nrows:
-        print(f"      (测试模式，只读前 {nrows:,} 行)")
+        print(f"      nrows={nrows:,}")
     df = pd.read_csv(csv_path, nrows=nrows)
-    print(f"      行数: {len(df):,}")
-    print(f"      列: {list(df.columns)}")
+    validate_columns(df)
+    print(f"      rows={len(df):,}, cols={len(df.columns)}")
 
-    # ========================================
-    # 计算 flow_id
-    # ========================================
-    print("[2/5] 计算 flow_id（双向合并）...")
-    df["flow_id"] = df.apply(canonical_flow_id, axis=1)
-    unique_flows = df["flow_id"].nunique()
-    print(f"      唯一流数: {unique_flows:,}")
+    print("[2/4] Convert rows to flow JSONL entries")
+    flows = []
+    label_counts = Counter()
+    empty_text = 0
+    event_counts = []
 
-    # ========================================
-    # 按 flow_id 分组处理
-    # ========================================
-    print("[3/5] 按流归组、提取事件...")
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="preprocess", unit="row"):
+        label_id, label_name = parse_label(row.get("label"))
+        text, num_events = build_flow_text(row)
+        if not text:
+            empty_text += 1
+        event_counts.append(num_events)
+        label_counts[label_name] += 1
 
-    flows_output = []
-    # 统计
-    total_events = 0
-    total_ssl = 0
-    total_x509 = 0
+        flows.append(
+            {
+                "flow_id": canonical_flow_id(row),
+                "src_ip": str(row["src_ip"]),
+                "dst_ip": str(row["dst_ip"]),
+                "text": text,
+                "label": label_id,
+                "label_name": label_name,
+                "num_events": num_events,
+                "num_features": extract_num_features(row),
+            }
+        )
 
-    grouped = df.groupby("flow_id")
+    print("[3/4] Stats")
+    print(f"      flows={len(flows):,}")
+    print(f"      labels={dict(label_counts)}")
+    print(f"      empty_text={empty_text:,}")
+    if event_counts:
+        print(
+            "      events_per_flow="
+            f"min={min(event_counts)}, max={max(event_counts)}, "
+            f"avg={sum(event_counts) / len(event_counts):.2f}"
+        )
 
-    for fid, group in tqdm(grouped, desc="处理流", unit="流"):
-        # 按时间排序
-        group = group.sort_values("timestamp")
-
-        # 从 context_text 提取所有事件
-        all_events = []
-        for _, row in group.iterrows():
-            ctx = row["context_text"] if "context_text" in row else None
-            if pd.notna(ctx):
-                all_events.extend(parse_context_text(str(ctx)))
-
-        # 统计事件类型
-        total_events += len(all_events)
-        total_ssl += sum(1 for e in all_events if e["type"] == "ssl")
-        total_x509 += sum(1 for e in all_events if e["type"] == "x509")
-
-        # 取 label（同一条流的所有行 label 应该一致，取第一个非空）
-        label = None
-        if "label" in group.columns:
-            for _, row in group.iterrows():
-                if pd.notna(row["label"]):
-                    label = int(row["label"])
-                    break
-
-        # 取 summary_json（取第一个非空的）
-        summary_json_str = None
-        if "summary_json" in group.columns:
-            for _, row in group.iterrows():
-                if pd.notna(row["summary_json"]):
-                    summary_json_str = str(row["summary_json"])
-                    break
-
-        # 构建流文本
-        text = build_flow_text(all_events)
-
-        # 提取数值特征
-        num_features = extract_num_features(summary_json_str)
-
-        # 确定代表性的 src_ip / dst_ip（用于后续追溯）
-        first_row = group.iloc[0]
-        src_ip = str(first_row["src_ip"])
-        dst_ip = str(first_row["dst_ip"])
-
-        flows_output.append({
-            "flow_id": fid,
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "text": text,
-            "label": label,
-            "num_events": len(all_events),
-            "num_features": num_features,
-        })
-
-    # ========================================
-    # 统计信息
-    # ========================================
-    print(f"\n[4/5] 统计信息:")
-    print(f"      总流数:      {len(flows_output):,}")
-    print(f"      总事件数:     {total_events:,}")
-    print(f"        SSL 事件:   {total_ssl:,}")
-    print(f"        X509 事件:  {total_x509:,}")
-
-    label_counts = defaultdict(int)
-    for f in flows_output:
-        label_counts[f["label"]] += 1
-    print(f"      label 分布:  {dict(label_counts)}")
-
-    # 事件数分布
-    event_counts = [f["num_events"] for f in flows_output]
-    print(f"      每条流事件数: min={min(event_counts)}, max={max(event_counts)}, "
-          f"avg={sum(event_counts)/len(event_counts):.1f}")
-
-    # ========================================
-    # 保存 JSONL
-    # ========================================
-    print(f"\n[5/5] 保存到: {output_path}")
-    import os
+    print(f"[4/4] Save JSONL: {output_path}")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        for entry in flows_output:
+        for entry in flows:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    print(f"      输出 {len(flows_output):,} 条流")
-    print("预处理完成!")
-    return flows_output
+    return flows
 
 
-def preprocess_supervised(csv_path: str = None, output_path: str = None, nrows: int = None):
-    """生成LoRA监督训练数据：data/processed/supervised_flows.jsonl。"""
-    return preprocess(
-        csv_path=csv_path,
-        output_path=output_path or SUPERVISED_FLOWS_JSONL,
-        nrows=nrows,
-        target="supervised",
-    )
+def preprocess_supervised(csv_path: str | None = None, output_path: str | None = None, nrows: int | None = None):
+    return preprocess(csv_path, output_path or SUPERVISED_FLOWS_JSONL, nrows, target="supervised")
 
 
-def preprocess_pretrain(csv_path: str = None, output_path: str = None, nrows: int = None):
-    """生成RTD继续预训练语料：data/processed/pretrain_flows.jsonl。"""
-    return preprocess(
-        csv_path=csv_path,
-        output_path=output_path or PRETRAIN_FLOWS_JSONL,
-        nrows=nrows,
-        target="pretrain",
-    )
+def preprocess_pretrain(csv_path: str | None = None, output_path: str | None = None, nrows: int | None = None):
+    return preprocess(csv_path, output_path or PRETRAIN_FLOWS_JSONL, nrows, target="pretrain")
 
 
-def preprocess_feature(csv_path: str = None, output_path: str = None, nrows: int = None):
-    """生成最终特征提取数据：data/processed/feature_flows.jsonl。"""
-    return preprocess(
-        csv_path=csv_path,
-        output_path=output_path or FEATURE_FLOWS_JSONL,
-        nrows=nrows,
-        target="feature",
-    )
+def preprocess_feature(csv_path: str | None = None, output_path: str | None = None, nrows: int | None = None):
+    return preprocess(csv_path, output_path or FEATURE_FLOWS_JSONL, nrows, target="feature")
 
 
-def preprocess_all(nrows: int = None):
-    """按约定同时生成 pretrain/supervised/feature 三份JSONL。"""
-    print("=== 生成RTD继续预训练语料 ===")
+def preprocess_all(nrows: int | None = None):
+    print("=== Generate RTD pretraining corpus ===")
     pretrain_flows = preprocess_pretrain(nrows=nrows)
-    print("\n=== 生成LoRA监督训练数据 ===")
+    print("\n=== Generate LoRA supervised corpus ===")
     supervised_flows = preprocess_supervised(nrows=nrows)
-    print("\n=== 生成最终特征提取数据 ===")
+    print("\n=== Generate final feature extraction corpus ===")
     feature_flows = preprocess_feature(nrows=nrows)
     return pretrain_flows, supervised_flows, feature_flows
 
 
-# ============================================================
-# 入口
-# ============================================================
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="预处理CSV并生成任务二JSONL数据")
+    parser = argparse.ArgumentParser(description="Preprocess task-1 multiclass flow CSV")
     parser.add_argument(
         "--target",
         choices=["all", "pretrain", "supervised", "feature"],
         default="all",
-        help="要生成的数据集类型，默认all",
     )
-    parser.add_argument(
-        "--nrows",
-        type=int,
-        default=None,
-        help="只读取前n行用于测试；默认全量处理",
-    )
+    parser.add_argument("--nrows", type=int, default=None)
+    parser.add_argument("--csv-path", default=None)
     args = parser.parse_args()
 
     if args.target == "pretrain":
-        preprocess_pretrain(nrows=args.nrows)
+        preprocess_pretrain(csv_path=args.csv_path, nrows=args.nrows)
     elif args.target == "supervised":
-        preprocess_supervised(nrows=args.nrows)
+        preprocess_supervised(csv_path=args.csv_path, nrows=args.nrows)
     elif args.target == "feature":
-        preprocess_feature(nrows=args.nrows)
+        preprocess_feature(csv_path=args.csv_path, nrows=args.nrows)
     else:
-        preprocess_all(nrows=args.nrows)
+        if args.csv_path is not None:
+            preprocess_pretrain(csv_path=args.csv_path, nrows=args.nrows)
+            preprocess_supervised(csv_path=args.csv_path, nrows=args.nrows)
+            preprocess_feature(csv_path=args.csv_path, nrows=args.nrows)
+        else:
+            preprocess_all(nrows=args.nrows)

@@ -16,6 +16,13 @@ wheels/
 # IDE
 .idea/
 
+# Model weights (too large for git)
+models/
+checkpoints/
+*.safetensors
+*.bin
+*.h5
+*.ot
 
 # Data (too large, regeneratable)
 data/
@@ -30,3 +37,7 @@ data_example/
 docs/
 memory/
 hf_cache/
+
+final_multiclass_features.csv
+
+.agents/

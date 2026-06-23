@@ -1,69 +1,46 @@
-"""
-任务二 全局配置
-所有路径、超参数、常量都在这里，其他地方 import 即可
-"""
+"""Global configuration for task 2."""
 
 import os
 
-# ============================================================
-# 路径配置（全部基于 E 盘项目根目录）
-# ============================================================
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 数据
+# Data paths
 DATA_DIR = os.path.join(ROOT, "data")
 INPUT_DIR = os.path.join(DATA_DIR, "input")
 PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
 OUTPUT_DIR = os.path.join(DATA_DIR, "output")
 SPLIT_DIR = os.path.join(DATA_DIR, "splits")
 
-# 样例数据（欧鲁金给的，先用这个开发，正式数据放 input/）
-EXAMPLE_CSV = os.path.join(ROOT, "data_example", "merged_with_context_CIC-DoHBrw-2020.csv")
-
-# 正式输入CSV
-#   pretrain_flows.csv:   给RTD继续预训练，可以无label
-#   supervised_flows.csv: 给LoRA分类器监督训练
-#   feature_flows.csv:    欧鲁金任务一产出，给最终特征提取
-SUPERVISED_INPUT_CSV = os.path.join(INPUT_DIR, "supervised_flows.csv")
 PRETRAIN_INPUT_CSV = os.path.join(INPUT_DIR, "pretrain_flows.csv")
+SUPERVISED_INPUT_CSV = os.path.join(INPUT_DIR, "supervised_flows.csv")
 FEATURE_INPUT_CSV = os.path.join(INPUT_DIR, "feature_flows.csv")
 
-# 兼容早期样例输入：如果 supervised_flows.csv 不存在，会回退到这个路径
-INPUT_CSV = os.path.join(INPUT_DIR, "merged_with_context_CIC-DoHBrw-2020.csv")
-
-# 预处理输出
 PRETRAIN_FLOWS_JSONL = os.path.join(PROCESSED_DIR, "pretrain_flows.jsonl")
 SUPERVISED_FLOWS_JSONL = os.path.join(PROCESSED_DIR, "supervised_flows.jsonl")
 FEATURE_FLOWS_JSONL = os.path.join(PROCESSED_DIR, "feature_flows.jsonl")
 
-# 固定监督训练划分
 TRAIN_JSONL = os.path.join(SPLIT_DIR, "train.jsonl")
 VAL_JSONL = os.path.join(SPLIT_DIR, "val.jsonl")
 TEST_JSONL = os.path.join(SPLIT_DIR, "test.jsonl")
 
-# 特征输出
 FEATURES_PURE_CSV = os.path.join(OUTPUT_DIR, "features_pure.csv")
 FEATURES_FUSED_CSV = os.path.join(OUTPUT_DIR, "features_fused.csv")
 
-# 模型
+# Model/checkpoint paths
 MODEL_DIR = os.path.join(ROOT, "models", "deberta-v3-base")
 CHECKPOINT_DIR = os.path.join(ROOT, "checkpoints")
 PRETRAIN_DIR = os.path.join(CHECKPOINT_DIR, "pretrain")
 LORA_DIR = os.path.join(CHECKPOINT_DIR, "lora")
 
-# ============================================================
-# 训练超参数
-# ============================================================
-MAX_LENGTH = 512          # DeBERTa 最大序列长度
-
-# RTD continued pretraining
+# Training hyperparameters
+MAX_LENGTH = 512
 PRETRAIN_MAX_LENGTH = 256
 PRETRAIN_BATCH_SIZE = 1
 PRETRAIN_EPOCHS = 3
 PRETRAIN_LR = 3e-5
 PRETRAIN_WARMUP = 1000
 
-# LoRA 微调
 LORA_BATCH_SIZE = 16
 LORA_EPOCHS = 5
 LORA_LR = 2e-4
@@ -72,58 +49,84 @@ LORA_ALPHA = 16
 LORA_DROPOUT = 0.1
 LORA_TARGET_MODULES = ["query_proj", "value_proj", "key_proj"]
 
-# 通用
 SEED = 42
 TRAIN_RATIO = 0.6
 VAL_RATIO = 0.2
-# TEST_RATIO = 0.2（剩下的）
 
-# ============================================================
-# 事件字段映射
-# ============================================================
+# Eight-class task labels. Keep this order stable because it is written into
+# classifier configs and output labels.
+CLASS_LABELS = [
+    "benign",
+    "adware",
+    "dns2tcp",
+    "dnscat2",
+    "iodine",
+    "ransomware",
+    "scareware",
+    "smsmalware",
+]
+LABEL2ID = {name: idx for idx, name in enumerate(CLASS_LABELS)}
+ID2LABEL = {idx: name for name, idx in LABEL2ID.items()}
+NUM_LABELS = len(CLASS_LABELS)
 
-# SSL 事件中保留的字段：{原始字段名: 压缩后的字段名}
-SSL_FIELDS = {
-    "version": "ver",
-    "cipher": "cipher",
-    "curve": "curve",
-    "server_name": "sni",
-    "resumed": "resumed",
-    "established": "est",
-    "ssl_history": "hist",
-}
-
-# X509 事件中保留的字段
-X509_FIELDS = {
-    "certificate.subject": "subj",
-    "certificate.issuer": "issuer",
-    "certificate.key_length": "key_len",
-    "certificate.sig_alg": "sig",
-    "certificate.not_valid_before": "not_bef",
-    "certificate.not_valid_after": "not_aft",
-}
-
-# summary_json 中提取的数值特征（用于融合 CSV）
-# 格式: (json中的路径, 输出列名)
-NUM_FEATURES = [
-    # F_meta 字段
-    (["F_meta", "handshake_duration"], "hs_duration"),
-    (["F_meta", "key_length"], "key_length"),
-    (["F_meta", "cert_valid_days"], "cert_valid_days"),
-    (["F_meta", "cn_length"], "cn_length"),
-    (["F_meta", "cert_chain_depth"], "cert_chain_depth"),
-    (["F_meta", "session_id_len"], "session_id_len"),
-    (["F_meta", "tls_ext_count"], "tls_ext_count"),
-    (["F_meta", "first_cert_arrival_delay"], "cert_arrival_delay"),
-    (["F_meta", "flow_interval_jitter"], "flow_jitter"),
-    (["F_meta", "self_signed"], "self_signed"),
-    (["F_meta", "has_unknown_ca"], "has_unknown_ca"),
-    # F_agg_struct 字段
-    (["F_agg_struct", "rst_ratio"], "rst_ratio"),
-    (["F_agg_struct", "handshake_fail_rate"], "hs_fail_rate"),
-    (["F_agg_struct", "reconnection_flag"], "reconn_flag"),
-    (["F_agg_struct", "conn_count"], "conn_count"),
-    (["F_agg_struct", "avg_duration"], "avg_duration"),
-    (["F_agg_struct", "unique_dst_count"], "uniq_dst_count"),
-    (["F_agg_struct", "src_ip_abnormal_ratio"], "src_abn_ratio"),
+# Flat numeric columns from final_multiclass_features.csv. Source/leakage
+# columns such as dataset_source, subfolder, pcap_filename, and raw Zeek text
+# are intentionally excluded.
+NEW_FORMAT_NUM_FEATURES = [
+    "pkts_forward",
+    "pkts_backward",
+    "pkts_total",
+    "bytes_forward",
+    "bytes_backward",
+    "bytes_total",
+    "ratio_bytes_back_to_forward",
+    "pkt_len_max",
+    "pkt_len_min",
+    "pkt_len_mean",
+    "pkt_len_std",
+    "pkt_len_fwd_mean",
+    "pkt_len_fwd_std",
+    "pkt_len_bwd_mean",
+    "pkt_len_bwd_std",
+    "iat_max",
+    "iat_min",
+    "iat_mean",
+    "iat_std",
+    "iat_fwd_max",
+    "iat_fwd_min",
+    "iat_fwd_mean",
+    "iat_fwd_std",
+    "iat_bwd_max",
+    "iat_bwd_min",
+    "iat_bwd_mean",
+    "iat_bwd_std",
+    "flag_syn_count",
+    "flag_fin_count",
+    "flag_rst_count",
+    "flag_psh_count",
+    "flag_ack_count",
+    "rst_ratio",
+    "handshake_fail_rate",
+    "reconnect_count",
+    "conn_count",
+    "flow_interval_jitter",
+    "flow_interval_diff_mean",
+    "tcp_rst_count",
+    "reconnection_flag",
+    "unique_dst_count",
+    "src_ip_abnormal_ratio",
+    "duration_p25",
+    "duration_p50",
+    "duration_p75",
+    "weighted_conn_count",
+    "weighted_avg_duration",
+    "abnormal_to_conn_ratio",
+    "handshake_duration",
+    "cn_vowel_ratio",
+    "cn_digit_density",
+    "cn_special_char_density",
+    "cert_valid_days",
+    "cert_age_at_capture",
+    "cert_remaining_days",
+    "cert_chain_depth",
 ]
