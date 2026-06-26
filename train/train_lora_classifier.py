@@ -32,6 +32,7 @@ try:
         LORA_DIR,
         LORA_DROPOUT,
         LORA_EPOCHS,
+        LORA_GRAD_ACCUM_STEPS,
         LORA_LR,
         LORA_R,
         LORA_TARGET_MODULES,
@@ -51,6 +52,7 @@ except ImportError:
         LORA_DIR,
         LORA_DROPOUT,
         LORA_EPOCHS,
+        LORA_GRAD_ACCUM_STEPS,
         LORA_LR,
         LORA_R,
         LORA_TARGET_MODULES,
@@ -161,13 +163,22 @@ def evaluate(model, dataloader, device):
     }
 
 
-def train_lora_classifier(jsonl_path=None, base_model_dir=None, epochs=None, batch_size=None, lr=None):
+def train_lora_classifier(
+    jsonl_path=None,
+    base_model_dir=None,
+    epochs=None,
+    batch_size=None,
+    lr=None,
+    grad_accum_steps=None,
+):
     set_seed(SEED)
 
     if epochs is None:
         epochs = LORA_EPOCHS
     if batch_size is None:
         batch_size = LORA_BATCH_SIZE
+    if grad_accum_steps is None:
+        grad_accum_steps = LORA_GRAD_ACCUM_STEPS
     if lr is None:
         lr = LORA_LR
 
@@ -213,14 +224,20 @@ def train_lora_classifier(jsonl_path=None, base_model_dir=None, epochs=None, bat
     best_acc = -1.0
 
     print("\n[4/5] 开始LoRA分类器监督训练")
-    print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
+    print(
+        f"  epochs={epochs}, batch_size={batch_size}, "
+        f"grad_accum_steps={grad_accum_steps}, "
+        f"effective_batch_size={batch_size * grad_accum_steps}, lr={lr}"
+    )
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
         steps = 0
+        optimizer_steps = 0
+        optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(train_dl, desc=f"Epoch {epoch}/{epochs}", unit="batch")
-        for batch in pbar:
+        for step_idx, batch in enumerate(pbar, start=1):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
@@ -230,14 +247,18 @@ def train_lora_classifier(jsonl_path=None, base_model_dir=None, epochs=None, bat
             if not torch.isfinite(loss):
                 raise FloatingPointError("LoRA分类训练loss出现NaN/Inf，已停止训练")
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            (loss / grad_accum_steps).backward()
+
+            should_step = step_idx % grad_accum_steps == 0 or step_idx == len(train_dl)
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
 
             total_loss += loss.item()
             steps += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", opt_steps=optimizer_steps)
 
         train_loss = total_loss / max(1, steps)
         val_metrics = evaluate(model, val_dl, device)
