@@ -24,7 +24,7 @@ data/input/supervised_flows.csv
 data/input/feature_flows.csv
     -> train.preprocess
     -> data/processed/feature_flows.jsonl
-    -> train.extract_features
+    -> extract_features.py
     -> data/output/features_pure.csv, features_fused.csv
 ```
 
@@ -63,7 +63,7 @@ LoRA 分类训练：
 提取最终特征：
 
 ```powershell
-.\.venv\Scripts\python.exe -m train.extract_features
+.\.venv\Scripts\python.exe extract_features.py
 ```
 
 ## 输入输出约定
@@ -106,7 +106,6 @@ LoRA 分类训练：
     ├── dataset.py                       # 读取 supervised_flows.jsonl 并划分 train/val/test
     ├── pretrain.py                      # DeBERTa-v3 RTD/ELECTRA 风格继续预训练
     ├── train_lora_classifier.py         # LoRA 分类训练，用于塑造 encoder 特征空间
-    ├── extract_features.py              # 加载预训练 checkpoint + LoRA，输出最终特征 CSV
     └── __init__.py                      # Python 包标记
+├── extract_features.py                  # 加载预训练 checkpoint + LoRA，输出最终特征 CSV
 ```
-

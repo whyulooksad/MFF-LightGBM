@@ -14,7 +14,7 @@
         4. 保存继续预训练后的 discriminator encoder，供后续 LoRA 使用
 
 输入：
-    data/processed/pretrain_flows.jsonl，每行包含一条流的 text。
+    data/train/processed/pretrain_flows.jsonl，每行包含一条流的 text。
     该文件可以无label，专门作为RTD继续预训练语料。
 
 输出：
@@ -384,7 +384,7 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
     print("[1/5] 加载数据")
     texts = load_all_texts(jsonl_path)
     if not texts:
-        raise ValueError("没有可用于预训练的文本，请先生成 data/processed/pretrain_flows.jsonl")
+        raise ValueError("没有可用于预训练的文本，请先生成 data/train/processed/pretrain_flows.jsonl")
 
     print("\n[2/5] 加载 tokenizer、generator、discriminator")
     tokenizer = load_tokenizer()

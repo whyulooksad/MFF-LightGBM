@@ -1,18 +1,13 @@
 """
-Step 1: preprocess task-1 multiclass flow CSV.
+Preprocess a multiclass flow CSV into a single JSONL file.
 
 Input format:
     final_multiclass_features.csv style rows with:
     flow_uid, five-tuple fields, label, flat numeric features,
     zeek_conn_log, zeek_ssl_log, zeek_x509_log.
 
-Outputs:
-    data/processed/pretrain_flows.jsonl
-    data/processed/supervised_flows.jsonl
-    data/processed/feature_flows.jsonl
-
-Leakage/source columns such as dataset_source, subfolder, and pcap_filename are
-not used in model text or fused numeric features.
+Output:
+    A single JSONL file where each line contains a flow object with text, label, etc.
 """
 
 from __future__ import annotations
@@ -22,36 +17,91 @@ import json
 import math
 import os
 from collections import Counter
-from pathlib import Path
 
 import pandas as pd
 from tqdm import tqdm
 
-try:
-    from .config import (
-        FEATURE_FLOWS_JSONL,
-        FEATURE_INPUT_CSV,
-        LABEL2ID,
-        NEW_FORMAT_NUM_FEATURES,
-        PRETRAIN_FLOWS_JSONL,
-        PRETRAIN_INPUT_CSV,
-        ROOT,
-        SUPERVISED_FLOWS_JSONL,
-        SUPERVISED_INPUT_CSV,
-    )
-except ImportError:
-    from config import (
-        FEATURE_FLOWS_JSONL,
-        FEATURE_INPUT_CSV,
-        LABEL2ID,
-        NEW_FORMAT_NUM_FEATURES,
-        PRETRAIN_FLOWS_JSONL,
-        PRETRAIN_INPUT_CSV,
-        ROOT,
-        SUPERVISED_FLOWS_JSONL,
-        SUPERVISED_INPUT_CSV,
-    )
+# ====================== 内联配置（不再依赖 config.py） ======================
 
+# 八分类标签映射
+CLASS_LABELS = [
+    "benign",
+    "adware",
+    "dns2tcp",
+    "dnscat2",
+    "iodine",
+    "ransomware",
+    "scareware",
+    "smsmalware",
+]
+LABEL2ID = {name: idx for idx, name in enumerate(CLASS_LABELS)}
+
+# 需要保留的数值特征列名
+NEW_FORMAT_NUM_FEATURES = [
+    "pkts_forward",
+    "pkts_backward",
+    "pkts_total",
+    "bytes_forward",
+    "bytes_backward",
+    "bytes_total",
+    "ratio_bytes_back_to_forward",
+    "pkt_len_max",
+    "pkt_len_min",
+    "pkt_len_mean",
+    "pkt_len_std",
+    "pkt_len_fwd_mean",
+    "pkt_len_fwd_std",
+    "pkt_len_bwd_mean",
+    "pkt_len_bwd_std",
+    "iat_max",
+    "iat_min",
+    "iat_mean",
+    "iat_std",
+    "iat_fwd_max",
+    "iat_fwd_min",
+    "iat_fwd_mean",
+    "iat_fwd_std",
+    "iat_bwd_max",
+    "iat_bwd_min",
+    "iat_bwd_mean",
+    "iat_bwd_std",
+    "flag_syn_count",
+    "flag_fin_count",
+    "flag_rst_count",
+    "flag_psh_count",
+    "flag_ack_count",
+    "rst_ratio",
+    "handshake_fail_rate",
+    "reconnect_count",
+    "conn_count",
+    "flow_interval_jitter",
+    "flow_interval_diff_mean",
+    "tcp_rst_count",
+    "reconnection_flag",
+    "unique_dst_count",
+    "src_ip_abnormal_ratio",
+    "duration_p25",
+    "duration_p50",
+    "duration_p75",
+    "weighted_conn_count",
+    "weighted_avg_duration",
+    "abnormal_to_conn_ratio",
+    "handshake_duration",
+    "cn_vowel_ratio",
+    "cn_digit_density",
+    "cn_special_char_density",
+    "cert_valid_days",
+    "cert_age_at_capture",
+    "cert_remaining_days",
+    "cert_chain_depth",
+]
+
+# ---------- 修改的默认路径 ----------
+DEFAULT_CSV_PATH = r"D:\jinxian\Pycharm\比赛\final test show\data\csv\final_multiclass_features_test.csv"
+DEFAULT_OUTPUT_PATH = r"D:\jinxian\Pycharm\比赛\final test show\data\json\final_multiclass_features_test.jsonl"
+# ------------------------------------
+
+# ====================== 字段映射 ======================
 
 REQUIRED_COLUMNS = {
     "flow_uid",
@@ -109,27 +159,7 @@ X509_FIELDS = {
     "basic_constraints.ca": "ca",
 }
 
-
-def resolve_default_csv(target: str = "supervised") -> str:
-    target_paths = {
-        "pretrain": PRETRAIN_INPUT_CSV,
-        "supervised": SUPERVISED_INPUT_CSV,
-        "feature": FEATURE_INPUT_CSV,
-    }
-    preferred = target_paths[target]
-    if os.path.exists(preferred):
-        return preferred
-
-    root_csv = os.path.join(ROOT, "final_multiclass_features.csv")
-    if os.path.exists(root_csv):
-        print(f"[INFO] {preferred} not found; using {root_csv}")
-        return root_csv
-
-    raise FileNotFoundError(
-        f"Missing input CSV for target={target}. Expected {preferred} "
-        f"or {root_csv}."
-    )
-
+# ====================== 辅助函数 ======================
 
 def clean_value(value):
     if value is None:
@@ -143,7 +173,6 @@ def clean_value(value):
         return value.replace('"', "'").replace("\n", " ")
     return value
 
-
 def parse_literal_cell(value):
     value = clean_value(value)
     if value is None:
@@ -154,7 +183,6 @@ def parse_literal_cell(value):
         return ast.literal_eval(str(value))
     except (SyntaxError, ValueError):
         return None
-
 
 def compact_dict(data: dict, field_map: dict, event_type: str) -> dict:
     out = {"t": event_type}
@@ -167,10 +195,8 @@ def compact_dict(data: dict, field_map: dict, event_type: str) -> dict:
         out[dst] = val
     return out
 
-
 def compact_json(data: dict) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-
 
 def build_flow_text(row: pd.Series) -> tuple[str, int]:
     parts = []
@@ -193,7 +219,6 @@ def build_flow_text(row: pd.Series) -> tuple[str, int]:
 
     return " ".join(parts), len(parts)
 
-
 def parse_label(label_value) -> tuple[int | None, str | None]:
     label_name = clean_value(label_value)
     if label_name is None:
@@ -202,7 +227,6 @@ def parse_label(label_value) -> tuple[int | None, str | None]:
     if label_name not in LABEL2ID:
         raise ValueError(f"Unknown label: {label_value!r}. Expected one of {sorted(LABEL2ID)}")
     return LABEL2ID[label_name], label_name
-
 
 def parse_numeric(value):
     value = clean_value(value)
@@ -216,10 +240,8 @@ def parse_numeric(value):
         return None
     return number
 
-
 def extract_num_features(row: pd.Series) -> dict:
     return {col: parse_numeric(row.get(col)) for col in NEW_FORMAT_NUM_FEATURES}
-
 
 def canonical_flow_id(row: pd.Series) -> str:
     if clean_value(row.get("flow_uid")) is not None:
@@ -229,30 +251,22 @@ def canonical_flow_id(row: pd.Series) -> str:
     proto = str(row["protocol"]).lower()
     return f"{row['src_ip']}_{src_port}_{row['dst_ip']}_{dst_port}_{proto}_{row['timestamp']}"
 
-
 def validate_columns(df: pd.DataFrame):
     missing = sorted(REQUIRED_COLUMNS - set(df.columns))
     if missing:
         raise ValueError(f"Input CSV missing required columns: {missing}")
 
+# ====================== 核心预处理 ======================
 
 def preprocess(
-    csv_path: str | None = None,
-    output_path: str | None = None,
+    csv_path: str,
+    output_path: str,
     nrows: int | None = None,
-    target: str = "supervised",
 ):
-    if csv_path is None:
-        csv_path = resolve_default_csv(target=target)
-
-    if output_path is None:
-        output_paths = {
-            "pretrain": PRETRAIN_FLOWS_JSONL,
-            "supervised": SUPERVISED_FLOWS_JSONL,
-            "feature": FEATURE_FLOWS_JSONL,
-        }
-        output_path = output_paths[target]
-
+    """
+    读取 csv_path，转换为 JSONL 并写入 output_path。
+    返回生成的 flow 列表。
+    """
     print(f"[1/4] Read CSV: {csv_path}")
     if nrows:
         print(f"      nrows={nrows:,}")
@@ -305,52 +319,49 @@ def preprocess(
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     return flows
 
-
-def preprocess_supervised(csv_path: str | None = None, output_path: str | None = None, nrows: int | None = None):
-    return preprocess(csv_path, output_path or SUPERVISED_FLOWS_JSONL, nrows, target="supervised")
-
-
-def preprocess_pretrain(csv_path: str | None = None, output_path: str | None = None, nrows: int | None = None):
-    return preprocess(csv_path, output_path or PRETRAIN_FLOWS_JSONL, nrows, target="pretrain")
-
-
-def preprocess_feature(csv_path: str | None = None, output_path: str | None = None, nrows: int | None = None):
-    return preprocess(csv_path, output_path or FEATURE_FLOWS_JSONL, nrows, target="feature")
-
-
-def preprocess_all(nrows: int | None = None):
-    print("=== Generate RTD pretraining corpus ===")
-    pretrain_flows = preprocess_pretrain(nrows=nrows)
-    print("\n=== Generate LoRA supervised corpus ===")
-    supervised_flows = preprocess_supervised(nrows=nrows)
-    print("\n=== Generate final feature extraction corpus ===")
-    feature_flows = preprocess_feature(nrows=nrows)
-    return pretrain_flows, supervised_flows, feature_flows
-
+# ====================== 主程序 ======================
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Preprocess task-1 multiclass flow CSV")
-    parser.add_argument(
-        "--target",
-        choices=["all", "pretrain", "supervised", "feature"],
-        default="all",
+    parser = argparse.ArgumentParser(
+        description="Preprocess a multiclass flow CSV to JSONL"
     )
-    parser.add_argument("--nrows", type=int, default=None)
-    parser.add_argument("--csv-path", default=None)
+    parser.add_argument(
+        "--csv-path",
+        default=None,
+        help="Path to input CSV (default: specified inside script)",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Path to output JSONL (default: specified inside script)",
+    )
+    parser.add_argument(
+        "--nrows",
+        type=int,
+        default=None,
+        help="Limit number of rows to read (for testing)",
+    )
+
     args = parser.parse_args()
 
-    if args.target == "pretrain":
-        preprocess_pretrain(csv_path=args.csv_path, nrows=args.nrows)
-    elif args.target == "supervised":
-        preprocess_supervised(csv_path=args.csv_path, nrows=args.nrows)
-    elif args.target == "feature":
-        preprocess_feature(csv_path=args.csv_path, nrows=args.nrows)
+    # 确定 CSV 路径（如果命令行未提供，使用新的默认值）
+    input_csv = args.csv_path or DEFAULT_CSV_PATH
+    if not os.path.isfile(input_csv):
+        print(f"Error: Input CSV not found: {input_csv}")
+        exit(1)
+
+    # 确定输出路径
+    if args.output:
+        output_path = args.output
+    elif args.csv_path:
+        # 如果用户通过命令行提供了输入文件，输出文件基于输入文件名放置在同目录下
+        base = os.path.splitext(args.csv_path)[0]
+        output_path = f"{base}.jsonl"
     else:
-        if args.csv_path is not None:
-            preprocess_pretrain(csv_path=args.csv_path, nrows=args.nrows)
-            preprocess_supervised(csv_path=args.csv_path, nrows=args.nrows)
-            preprocess_feature(csv_path=args.csv_path, nrows=args.nrows)
-        else:
-            preprocess_all(nrows=args.nrows)
+        output_path = DEFAULT_OUTPUT_PATH
+
+    print(f"Input : {input_csv}")
+    print(f"Output: {output_path}")
+    preprocess(input_csv, output_path, nrows=args.nrows)

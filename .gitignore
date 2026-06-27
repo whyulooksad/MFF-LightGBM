@@ -1,43 +1,82 @@
-# Python-generated files
+# Python cache/build artifacts
 __pycache__/
-*.py[oc]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.py[cod]
+*$py.class
 build/
 dist/
 wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
+venv/
+env/
 
-# Environment & config
+# Local environment
 .env
+.env.*
+!.env.example
 .python-version
 
-# IDE
+# IDE / OS
 .idea/
+.vscode/
+.DS_Store
+Thumbs.db
 
-# Model weights (too large for git)
+# Model weights and training checkpoints
 models/
 checkpoints/
+hf_cache/
+*.pt
+*.pth
+*.ckpt
 *.safetensors
 *.bin
+*.onnx
 *.h5
 *.ot
 
-# Data (too large, regeneratable)
+# Data and generated feature files
 data/
 data_example/
 *.csv
+*.tsv
+*.jsonl
+*.parquet
+*.feather
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.pcap
+*.pcapng
 
-# Documents & temp
-*.pdf
-~$*
-*.docx
-
+# Reports, private notes, and office temp files
 docs/
 memory/
-hf_cache/
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+~$*
 
-final_multiclass_features.csv
+# Experiment outputs
+runs/
+wandb/
+mlruns/
+outputs/
+logs/
+*.log
+*.png
+*.jpg
+*.jpeg
+*.svg
 
+# Local agent/app state
 .agents/

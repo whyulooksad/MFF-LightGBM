@@ -7,7 +7,7 @@
     它服务于后续[CLS]特征提取。
 
 输入：
-    1. data/processed/supervised_flows.jsonl
+    1. data/train/processed/supervised_flows.jsonl
     2. checkpoints/pretrain/checkpoint-epoch*/ 中的RTD继续预训练encoder
 
 输出：

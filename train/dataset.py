@@ -1,6 +1,6 @@
 """
 步骤2：PyTorch Dataset 封装
-输入：data/processed/supervised_flows.jsonl
+输入：data/train/processed/supervised_flows.jsonl
 输出：DataLoader（训练/验证/测试）
 
 做的事：
@@ -155,11 +155,11 @@ def get_or_create_splits(flows=None, force_recreate=False):
     """
     获取固定划分。
 
-    如果 data/splits/train.jsonl、val.jsonl、test.jsonl 已存在，默认直接读取；
+    如果 data/train/splits/train.jsonl、val.jsonl、test.jsonl 已存在，默认直接读取；
     否则从 supervised_flows.jsonl 创建划分并保存。
     """
     if split_files_exist() and not force_recreate:
-        print("发现已保存的固定划分，直接读取 data/splits/*.jsonl")
+        print("发现已保存的固定划分，直接读取 data/train/splits/*.jsonl")
         return load_splits()
 
     if flows is None:

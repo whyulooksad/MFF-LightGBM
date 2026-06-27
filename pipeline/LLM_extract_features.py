@@ -25,40 +25,24 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 
-try:
-    from .config import (
-        FEATURES_FUSED_CSV,
-        FEATURES_PURE_CSV,
-        FEATURE_FLOWS_JSONL,
-        LORA_BATCH_SIZE,
-        LORA_DIR,
-        MAX_LENGTH,
-        MODEL_DIR,
-        NEW_FORMAT_NUM_FEATURES,
-        NUM_LABELS,
-        ID2LABEL,
-        LABEL2ID,
-        OUTPUT_DIR,
-        PRETRAIN_DIR,
-    )
-    from .dataset import load_flows
-except ImportError:
-    from config import (
-        FEATURES_FUSED_CSV,
-        FEATURES_PURE_CSV,
-        FEATURE_FLOWS_JSONL,
-        LORA_BATCH_SIZE,
-        LORA_DIR,
-        MAX_LENGTH,
-        MODEL_DIR,
-        NEW_FORMAT_NUM_FEATURES,
-        NUM_LABELS,
-        ID2LABEL,
-        LABEL2ID,
-        OUTPUT_DIR,
-        PRETRAIN_DIR,
-    )
-    from dataset import load_flows
+from pipeline.config import (
+    FEATURES_FUSED_CSV,
+    FEATURES_PURE_CSV,
+    FEATURE_FLOWS_JSONL,
+    PIPELINE_FEATURES_DIR,
+)
+from train.config import (
+    LORA_BATCH_SIZE,
+    LORA_DIR,
+    MAX_LENGTH,
+    MODEL_DIR,
+    NEW_FORMAT_NUM_FEATURES,
+    NUM_LABELS,
+    ID2LABEL,
+    LABEL2ID,
+    PRETRAIN_DIR,
+)
+from train.dataset import load_flows
 
 
 FEATURE_DIM = 768
@@ -191,7 +175,7 @@ def write_feature_csv(flows, features, output_path, fused=False):
 
     feat_cols = [f"feat_{i}" for i in range(FEATURE_DIM)]
     num_cols = list(NEW_FORMAT_NUM_FEATURES)
-    fieldnames = ["flow_id"] + feat_cols
+    fieldnames = ["flow_uid"] + feat_cols
     if fused:
         fieldnames += num_cols
     fieldnames += ["label", "label_name"]
@@ -202,7 +186,7 @@ def write_feature_csv(flows, features, output_path, fused=False):
 
         for flow, vector in zip(flows, features):
             row = {
-                "flow_id": flow.get("flow_id", ""),
+                "flow_uid": flow.get("flow_uid", ""),
                 "label": flow.get("label"),
                 "label_name": flow.get("label_name", ""),
             }
@@ -272,7 +256,7 @@ def extract_features(
         raise RuntimeError(f"特征维度不是{FEATURE_DIM}: {len(features[0])}")
 
     print("\n[4/4] 写出CSV")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(PIPELINE_FEATURES_DIR, exist_ok=True)
     if output_pure_csv is None:
         output_pure_csv = FEATURES_PURE_CSV
     if output_fused_csv is None:
