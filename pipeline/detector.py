@@ -52,6 +52,7 @@ from pipeline.config import (
     PIPELINE_OUTPUT_DIR,
     ROOT,
 )
+from pipeline.pca_reduce_features import reduce_feat_in_memory
 
 
 warnings.filterwarnings("ignore")
@@ -98,10 +99,10 @@ CONFUSION_CMAP = LinearSegmentedColormap.from_list(
     ["#fbfdff", "#e4f0f8", "#bdd9ed", "#79acd0", "#2f6f9f"],
 )
 METRIC_PALETTE = {
-    "Accuracy": "#FFB347",
-    "Precision": "#4682B4",
-    "Recall": "#ADD8E6",
-    "Weighted F1": "#C4A0E0",
+    "Accuracy": "#FF8C00",
+    "Precision": "#1E90FF",
+    "Recall": "#00BFFF",
+    "Weighted F1": "#9B59B6",
 }
 
 
@@ -294,7 +295,7 @@ def plot_confusion_matrix(cm: np.ndarray, labels: list[int], y_test: np.ndarray,
     cm_for_color = np.divide(cm, row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums != 0)
 
     plt.figure(figsize=(7.2, 5.8))
-    sns.heatmap(
+    ax = sns.heatmap(
         cm_for_color,
         annot=cm,
         annot_kws={"fontsize": 10},
@@ -308,6 +309,24 @@ def plot_confusion_matrix(cm: np.ndarray, labels: list[int], y_test: np.ndarray,
         vmin=0,
         vmax=1,
     )
+
+    # 单独加深左上角 cell (benign x benign),让它比对角线其他格子更突出
+    from matplotlib.patches import Rectangle
+
+    ylim = ax.get_ylim()
+    top = ylim[1]
+    y0 = top if ylim[0] > ylim[1] else top - 1
+    ax.add_patch(
+        Rectangle(
+            (0, y0), 1, 1,
+            facecolor="#173f5a", edgecolor="white", linewidth=0.3, zorder=2,
+        )
+    )
+    ax.text(
+        0.5, y0 + 0.5, str(int(cm[0, 0])),
+        ha="center", va="center", fontsize=10, color="white", zorder=3,
+    )
+
     plt.title(f"LightGBM (Weighted F1={weighted_f1:.3f})")
     plt.xlabel("Predicted")
     plt.ylabel("True")
@@ -505,13 +524,15 @@ def evaluate_baselines(
     return results_df.sort_values(by="F1", ascending=False), proba_by_model
 
 
-def main():
+def main(n_components: int = 64):
     print("=" * 60)
     print(" LightGBM detector: train / validate / test")
     print("=" * 60)
 
     print(f"\n[1/5] Read fused features: {INPUT_CSV}")
     raw_df = pd.read_csv(INPUT_CSV)
+    print(f"      PCA 降维 feat_*: 768 -> {n_components} 维 (manual 原样保留)")
+    raw_df = reduce_feat_in_memory(raw_df, n_components=n_components, seed=SEED)
     df = preprocess_detector_dataframe(raw_df)
     if LABEL_COL not in df.columns:
         raise ValueError(f"Detector stage requires a '{LABEL_COL}' column for train/test split")
@@ -625,4 +646,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LightGBM detector (PCA 降维版)")
+    parser.add_argument("--n-components", type=int, default=64, help="PCA 目标维度,默认 64")
+    args = parser.parse_args()
+    main(n_components=args.n_components)

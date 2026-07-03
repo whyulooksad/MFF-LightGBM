@@ -39,6 +39,7 @@ from pipeline.detector import (
     detector_feature_columns,
     preprocess_detector_dataframe,
 )
+from pipeline.pca_reduce_features import reduce_feat_in_memory
 
 
 REPORT_DIR = PIPELINE_OUTPUT_DIR / "detector_report" / "feature_ablation"
@@ -46,10 +47,10 @@ CHECKPOINT_DIR = ROOT / "checkpoints" / "detector" / "feature_ablation"
 BATCH_SIZE = 4096
 
 METRIC_PALETTE = {
-    "Accuracy": "#FFB347",
-    "Precision": "#4682B4",
-    "Recall": "#ADD8E6",
-    "Weighted F1": "#C4A0E0",
+    "Accuracy": "#FF8C00",
+    "Precision": "#1E90FF",
+    "Recall": "#00BFFF",
+    "Weighted F1": "#9B59B6",
 }
 
 
@@ -220,7 +221,7 @@ def plot_roc(y_test: np.ndarray, proba_by_group: dict[str, np.ndarray]) -> None:
     pd.DataFrame(auc_rows).to_csv(REPORT_DIR / "feature_ablation_auc.csv", index=False)
 
 
-def main():
+def main(n_components: int = 64):
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -229,6 +230,8 @@ def main():
     print("=" * 60)
     print(f"[1/4] Read fused features: {FEATURES_FUSED_CSV}")
     raw_df = pd.read_csv(FEATURES_FUSED_CSV)
+    print(f"      PCA 降维 feat_*: 768 -> {n_components} 维 (manual 原样保留)")
+    raw_df = reduce_feat_in_memory(raw_df, n_components=n_components, seed=SEED)
     df = preprocess_detector_dataframe(raw_df)
     if LABEL_COL not in df.columns:
         raise ValueError(f"Feature ablation requires a '{LABEL_COL}' column")
@@ -263,4 +266,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LightGBM feature ablation (PCA 降维版)")
+    parser.add_argument("--n-components", type=int, default=64, help="PCA 目标维度,默认 64")
+    args = parser.parse_args()
+    main(n_components=args.n_components)
