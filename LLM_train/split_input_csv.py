@@ -1,8 +1,8 @@
 """Split final train flow-feature CSV into task-2 training input CSV files.
 
 Default split:
-    67% -> data/train/input/pretrain_flows.csv
-    33% -> data/train/input/supervised_flows.csv
+    67% -> data/LLM_train/input/pretrain_flows.csv
+    33% -> data/LLM_train/input/supervised_flows.csv
 
 The split is stratified by the multiclass label so each subset keeps the same
 class balance. The source CSV is already flow-level, so each row is kept intact.

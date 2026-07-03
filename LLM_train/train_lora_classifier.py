@@ -7,7 +7,7 @@
     它服务于后续[CLS]特征提取。
 
 输入：
-    1. data/train/processed/supervised_flows.jsonl
+    1. data/LLM_train/processed/supervised_flows.jsonl
     2. checkpoints/pretrain/checkpoint-epoch*/ 中的RTD继续预训练encoder
 
 输出：
@@ -31,9 +31,11 @@ try:
         LORA_BATCH_SIZE,
         LORA_DIR,
         LORA_DROPOUT,
+        LORA_EARLY_STOP_PATIENCE,
         LORA_EPOCHS,
         LORA_GRAD_ACCUM_STEPS,
         LORA_LR,
+        LORA_MIN_DELTA,
         LORA_R,
         LORA_TARGET_MODULES,
         MAX_LENGTH,
@@ -51,9 +53,11 @@ except ImportError:
         LORA_BATCH_SIZE,
         LORA_DIR,
         LORA_DROPOUT,
+        LORA_EARLY_STOP_PATIENCE,
         LORA_EPOCHS,
         LORA_GRAD_ACCUM_STEPS,
         LORA_LR,
+        LORA_MIN_DELTA,
         LORA_R,
         LORA_TARGET_MODULES,
         MAX_LENGTH,
@@ -186,7 +190,7 @@ def train_lora_classifier(
         base_model_dir = latest_pretrain_checkpoint()
         if base_model_dir is None:
             raise FileNotFoundError(
-                "未找到RTD预训练checkpoint。请先运行 train/pretrain.py，"
+                "未找到RTD预训练checkpoint。请先运行 LLM_train/pretrain.py，"
                 "或显式传入 base_model_dir=MODEL_DIR 做代码smoke test。"
             )
 
@@ -222,6 +226,7 @@ def train_lora_classifier(
     best_dir = os.path.join(LORA_DIR, "best")
     best_f1 = -1.0
     best_acc = -1.0
+    stale_epochs = 0
 
     print("\n[4/5] 开始LoRA分类器监督训练")
     print(
@@ -270,15 +275,28 @@ def train_lora_classifier(
         )
 
         should_save = (
-            val_metrics["f1"] > best_f1
-            or (val_metrics["f1"] == best_f1 and val_metrics["accuracy"] > best_acc)
+            val_metrics["f1"] > best_f1 + LORA_MIN_DELTA
+            or (
+                abs(val_metrics["f1"] - best_f1) <= LORA_MIN_DELTA
+                and val_metrics["accuracy"] > best_acc + LORA_MIN_DELTA
+            )
         )
         if should_save:
             best_f1 = val_metrics["f1"]
             best_acc = val_metrics["accuracy"]
+            stale_epochs = 0
             print(f"  -> 保存最佳LoRA adapter到 {best_dir}")
             model.save_pretrained(best_dir)
             tokenizer.save_pretrained(best_dir)
+        else:
+            stale_epochs += 1
+            print(
+                f"  -> 验证指标未超过最佳模型: stale={stale_epochs}/"
+                f"{LORA_EARLY_STOP_PATIENCE}"
+            )
+            if stale_epochs >= LORA_EARLY_STOP_PATIENCE:
+                print("  -> 触发LoRA早停")
+                break
 
     print("\n[5/5] 测试集评估")
     if os.path.exists(best_dir):

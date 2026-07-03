@@ -80,3 +80,5 @@ logs/
 
 # Local agent/app state
 .agents/
+
+damn/

@@ -14,7 +14,7 @@
         4. 保存继续预训练后的 discriminator encoder，供后续 LoRA 使用
 
 输入：
-    data/train/processed/pretrain_flows.jsonl，每行包含一条流的 text。
+    data/LLM_train/processed/pretrain_flows.jsonl，每行包含一条流的 text。
     该文件可以无label，专门作为RTD继续预训练语料。
 
 输出：
@@ -43,11 +43,13 @@ try:
         MAX_LENGTH,
         MODEL_DIR,
         PRETRAIN_BATCH_SIZE,
+        PRETRAIN_EARLY_STOP_PATIENCE,
         PRETRAIN_DIR,
         PRETRAIN_EPOCHS,
         PRETRAIN_FLOWS_JSONL,
         PRETRAIN_LR,
         PRETRAIN_MAX_LENGTH,
+        PRETRAIN_MIN_DELTA,
         PRETRAIN_WARMUP,
         SEED,
     )
@@ -56,11 +58,13 @@ except ImportError:
         MAX_LENGTH,
         MODEL_DIR,
         PRETRAIN_BATCH_SIZE,
+        PRETRAIN_EARLY_STOP_PATIENCE,
         PRETRAIN_DIR,
         PRETRAIN_EPOCHS,
         PRETRAIN_FLOWS_JSONL,
         PRETRAIN_LR,
         PRETRAIN_MAX_LENGTH,
+        PRETRAIN_MIN_DELTA,
         PRETRAIN_WARMUP,
         SEED,
     )
@@ -384,7 +388,7 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
     print("[1/5] 加载数据")
     texts = load_all_texts(jsonl_path)
     if not texts:
-        raise ValueError("没有可用于预训练的文本，请先生成 data/train/processed/pretrain_flows.jsonl")
+        raise ValueError("没有可用于预训练的文本，请先生成 data/LLM_train/processed/pretrain_flows.jsonl")
 
     print("\n[2/5] 加载 tokenizer、generator、discriminator")
     tokenizer = load_tokenizer()
@@ -428,6 +432,7 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
 
     os.makedirs(PRETRAIN_DIR, exist_ok=True)
     best_loss = float("inf")
+    stale_epochs = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -471,12 +476,23 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
         avg_loss = epoch_loss / max(1, epoch_steps)
         print(f"  Epoch {epoch} 完成: avg_loss={avg_loss:.4f}")
 
-        if avg_loss < best_loss:
+        improved = avg_loss < best_loss - PRETRAIN_MIN_DELTA
+        if improved:
             best_loss = avg_loss
+            stale_epochs = 0
             save_path = os.path.join(PRETRAIN_DIR, f"checkpoint-epoch{epoch}")
             print(f"  -> 保存最佳 discriminator encoder 到 {save_path}")
             model.discriminator.save_pretrained(save_path)
             tokenizer.save_pretrained(save_path)
+        else:
+            stale_epochs += 1
+            print(
+                f"  -> loss 未明显降低: stale={stale_epochs}/"
+                f"{PRETRAIN_EARLY_STOP_PATIENCE}"
+            )
+            if stale_epochs >= PRETRAIN_EARLY_STOP_PATIENCE:
+                print("  -> 触发预训练早停")
+                break
 
     print("\n[5/5] RTD 继续预训练完成")
     print(f"  最佳 loss: {best_loss:.4f}")
@@ -487,4 +503,4 @@ def pretrain(jsonl_path=None, epochs=None, batch_size=None, lr=None):
 
 if __name__ == "__main__":
     print("=== DeBERTa-v3 RTD 继续预训练 ===\n")
-    pretrain(epochs=1, batch_size=PRETRAIN_BATCH_SIZE)
+    pretrain(batch_size=PRETRAIN_BATCH_SIZE)

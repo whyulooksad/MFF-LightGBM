@@ -7,8 +7,8 @@ Input format:
     zeek_conn_log, zeek_ssl_log, zeek_x509_log.
 
 Outputs:
-    data/train/processed/pretrain_flows.jsonl
-    data/train/processed/supervised_flows.jsonl
+    data/LLM_train/processed/pretrain_flows.jsonl
+    data/LLM_train/processed/supervised_flows.jsonl
     data/pipeline/input/feature_flows.jsonl
 
 Identifier/source columns such as five-tuple fields, timestamp, dataset_source,
@@ -31,7 +31,7 @@ from pipeline.config import (
     FEATURE_FLOWS_JSONL,
     FLOW_FEATURES_TEST_CSV,
 )
-from train.config import (
+from LLM_train.config import (
     FLOW_FEATURES_TRAIN_CSV,
     LABEL2ID,
     NEW_FORMAT_NUM_FEATURES,

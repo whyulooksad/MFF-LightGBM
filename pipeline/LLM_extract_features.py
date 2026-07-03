@@ -6,13 +6,13 @@
     为每条监督流提取[CLS] 768维特征。
 
 输入：
-    data/processed/feature_flows.jsonl
+    data/pipeline/input/feature_flows.jsonl
     checkpoints/pretrain/checkpoint-epoch*/
     checkpoints/lora/best/
 
 输出：
-    data/output/features_pure.csv
-    data/output/features_fused.csv
+    data/pipeline/features/features_pure.csv
+    data/pipeline/features/features_fused.csv
 """
 
 import csv
@@ -31,7 +31,7 @@ from pipeline.config import (
     FEATURE_FLOWS_JSONL,
     PIPELINE_FEATURES_DIR,
 )
-from train.config import (
+from LLM_train.config import (
     LORA_BATCH_SIZE,
     LORA_DIR,
     MAX_LENGTH,
@@ -42,7 +42,7 @@ from train.config import (
     LABEL2ID,
     PRETRAIN_DIR,
 )
-from train.dataset import load_flows
+from LLM_train.dataset import load_flows
 
 
 FEATURE_DIM = 768
@@ -80,7 +80,7 @@ def build_model(base_model_dir=None, adapter_dir=None):
         base_model_dir = latest_pretrain_checkpoint()
         if base_model_dir is None:
             raise FileNotFoundError(
-                "未找到RTD预训练checkpoint。请先运行 train/pretrain.py，"
+                "未找到RTD预训练checkpoint。请先运行 LLM_train/pretrain.py，"
                 "或显式传入 base_model_dir=MODEL_DIR 做代码smoke test。"
             )
 
@@ -89,7 +89,7 @@ def build_model(base_model_dir=None, adapter_dir=None):
 
     if adapter_dir is None:
         raise FileNotFoundError(
-            "未找到LoRA adapter: checkpoints/lora/best。请先运行 train/train_lora_classifier.py，"
+            "未找到LoRA adapter: checkpoints/lora/best。请先运行 LLM_train/train_lora_classifier.py，"
             "或显式传入 adapter_dir=None 且 allow_no_lora=True 做代码smoke test。"
         )
 

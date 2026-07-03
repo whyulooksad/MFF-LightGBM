@@ -6,7 +6,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Data paths
 DATA_DIR = os.path.join(ROOT, "data")
 FLOW_FEATURES_DIR = os.path.join(DATA_DIR, "flow_features")
-TRAIN_DATA_DIR = os.path.join(DATA_DIR, "train")
+TRAIN_DATA_DIR = os.path.join(DATA_DIR, "LLM_train")
 
 INPUT_DIR = os.path.join(TRAIN_DATA_DIR, "input")
 PROCESSED_DIR = os.path.join(TRAIN_DATA_DIR, "processed")
@@ -34,13 +34,17 @@ LORA_DIR = os.path.join(CHECKPOINT_DIR, "lora")
 MAX_LENGTH = 512
 PRETRAIN_MAX_LENGTH = 256
 PRETRAIN_BATCH_SIZE = 1
-PRETRAIN_EPOCHS = 3
+PRETRAIN_EPOCHS = 5
+PRETRAIN_EARLY_STOP_PATIENCE = 2
+PRETRAIN_MIN_DELTA = 1e-4
 PRETRAIN_LR = 3e-5
 PRETRAIN_WARMUP = 1000
 
 LORA_BATCH_SIZE = 2
 LORA_GRAD_ACCUM_STEPS = 8
-LORA_EPOCHS = 5
+LORA_EPOCHS = 20
+LORA_EARLY_STOP_PATIENCE = 3
+LORA_MIN_DELTA = 1e-4
 LORA_LR = 2e-4
 LORA_R = 8
 LORA_ALPHA = 16

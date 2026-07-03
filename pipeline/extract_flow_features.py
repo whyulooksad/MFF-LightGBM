@@ -799,9 +799,10 @@ def main():
     train_files, test_files = [], []
     for root, dirs, files in os.walk(WORK_DIR):
         for f in files:
-            if f.endswith('_train.pcap'):
+            lower_name = f.lower()
+            if lower_name.endswith(('_train.pcap', '_train.pcapng')):
                 train_files.append(os.path.join(root, f))
-            elif f.endswith('_test.pcap'):
+            elif lower_name.endswith(('_test.pcap', '_test.pcapng')):
                 test_files.append(os.path.join(root, f))
 
     if not train_files and not test_files:

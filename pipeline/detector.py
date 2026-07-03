@@ -1,339 +1,628 @@
 # -*- coding: utf-8 -*-
-"""
-detect_malware.py  (完整版：包含前端可视化数据导出)
-==================================================
-基于已训练的分类器对降维后的流量特征进行恶意加密流量检测，
-并生成一系列可直接用于前端绘图的 CSV/JSON 文件。
+"""LightGBM detector stage: train, validate, test, and export reports."""
 
-用法：直接运行本脚本，修改顶部的路径配置即可。
-"""
+from __future__ import annotations
 
-import os
-import joblib
+import json
+import pickle
+import re
+import warnings
+from collections import Counter
+from pathlib import Path
+
+import lightgbm as lgb
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+import seaborn as sns
+from matplotlib.colors import LinearSegmentedColormap
+from scipy.stats import entropy
 from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.utils.class_weight import compute_sample_weight
 
 try:
-    from .config import DETECTION_ASSETS_DIR, DETECTION_RESULTS_CSV, DETECTOR_MODEL_DIR, FEATURES_FUSED_CSV
+    from xgboost import XGBClassifier
+
+    XGB_AVAILABLE = True
 except ImportError:
-    from config import DETECTION_ASSETS_DIR, DETECTION_RESULTS_CSV, DETECTOR_MODEL_DIR, FEATURES_FUSED_CSV
+    XGB_AVAILABLE = False
 
-# ====================== 可调配置 (直接修改此处) ======================
-# 输入降维后的 CSV（由 supcon_ae.py 或特征工程生成）
-INPUT_CSV = str(FEATURES_FUSED_CSV)
-# 输出检测结果 CSV（包含每条流的详细预测）
-OUTPUT_CSV = str(DETECTION_RESULTS_CSV)
-# 前端可视化用数据文件保存目录
-OUTPUT_DIR = str(DETECTION_ASSETS_DIR)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+from LLM_train.config import ID2LABEL, LABEL2ID
+from pipeline.config import (
+    DETECTION_ASSETS_DIR,
+    DETECTION_RESULTS_CSV,
+    FEATURES_FUSED_CSV,
+    PIPELINE_OUTPUT_DIR,
+    ROOT,
+)
 
-# 模型文件路径
-MODEL_DIR = str(DETECTOR_MODEL_DIR)
-SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
-MODEL_FILES = {
-    "RandomForest": os.path.join(MODEL_DIR, "rf_model.pkl"),
-    "ExtraTrees":   os.path.join(MODEL_DIR, "et_model.pkl"),
-    "LightGBM":     os.path.join(MODEL_DIR, "lgb_model.txt"),
-    "XGBoost":      os.path.join(MODEL_DIR, "xgb_model.json"),
-}
-ACTIVE_MODELS = ["RandomForest", "ExtraTrees", "LightGBM"]  # 可修改
 
-# 标识列（保留至输出文件，不参与预测）
-ID_COLS = ["flow_uid"]
-# 特征列前缀（降维特征通常以 z_ 开头）
-FEATURE_PREFIX = "feat_"
-# 高置信恶意流阈值（大于该值展示在恶意详情中）
-MALICIOUS_CONF_THRESHOLD = 0.8
-# 批预测大小
+warnings.filterwarnings("ignore")
+
+INPUT_CSV = FEATURES_FUSED_CSV
+OUTPUT_CSV = DETECTION_RESULTS_CSV
+OUTPUT_DIR = PIPELINE_OUTPUT_DIR
+ASSETS_DIR = DETECTION_ASSETS_DIR
+CHECKPOINT_DIR = ROOT / "checkpoints" / "detector"
+MODEL_PKL = CHECKPOINT_DIR / "best_lgb_model.pkl"
+MODEL_TXT = CHECKPOINT_DIR / "best_lgb_model.txt"
+FEATURE_COLUMNS_JSON = CHECKPOINT_DIR / "feature_columns.json"
+REPORT_DIR = OUTPUT_DIR / "detector_report"
+
+LABEL_COL = "label"
+ID_COL_CANDIDATES = ("flow_uid", "flow_id")
+DROP_COLS = (
+    "flow_uid",
+    "flow_id",
+    "src_ip",
+    "src_port",
+    "dst_ip",
+    "dst_port",
+    "protocol",
+    "timestamp",
+    "dataset_source",
+    "subfolder",
+    "pcap_filename",
+    "zeek_conn_log",
+    "zeek_ssl_log",
+    "zeek_x509_log",
+    "label_name",
+)
+
+TEST_SIZE = 0.2
+VAL_SIZE_WITHIN_TRAIN = 0.125
+SEED = 42
 BATCH_SIZE = 4096
-# 趋势分析：若有时间戳则用列名，否则按样本序号分段
-TIME_COL = "timestamp"          # 如果存在，将用于趋势计算；不存在则自动忽略
-TREND_WINDOW = 100              # 每批样本数（时间窗方式时无效）
-# 降维可视化是否使用 PCA 降到 2D（使用已有的 z_ 特征）
-USE_PCA_2D = True
-RANDOM_STATE = 42
+BENIGN_LABEL = 0
+MALICIOUS_CONF_THRESHOLD = 0.8
 
-# ====================== 工具函数 ======================
+CONFUSION_CMAP = LinearSegmentedColormap.from_list(
+    "pastel_blues",
+    ["#fbfdff", "#e4f0f8", "#bdd9ed", "#79acd0", "#2f6f9f"],
+)
+METRIC_PALETTE = {
+    "Accuracy": "#FFB347",
+    "Precision": "#4682B4",
+    "Recall": "#ADD8E6",
+    "Weighted F1": "#C4A0E0",
+}
 
-def load_models(model_dir, model_files, active_models):
-    loaded = {}
-    scaler = None
-    if os.path.exists(SCALER_PATH):
-        scaler = joblib.load(SCALER_PATH)
-        print(f"标准化器已加载: {SCALER_PATH}")
-    else:
-        print("警告：未找到标准化器文件，将不对特征进行标准化。")
 
-    for name, path in model_files.items():
-        if active_models and name not in active_models:
-            continue
-        if not os.path.exists(path):
-            print(f"警告：模型文件不存在: {path}，跳过 {name}")
-            continue
-        if name == "LightGBM":
-            import lightgbm as lgb
-            try:
-                model = lgb.Booster(model_file=path)
-            except:
-                model = joblib.load(path)
-        elif name == "XGBoost":
-            import xgboost as xgb
-            model = xgb.Booster()
-            model.load_model(path)
+def id_columns(df: pd.DataFrame) -> list[str]:
+    return [col for col in ID_COL_CANDIDATES if col in df.columns]
+
+
+def normalize_label_series(labels: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(labels, errors="coerce")
+    missing_numeric = numeric.isna() & labels.notna()
+    if not missing_numeric.any():
+        return numeric.astype("Int64")
+
+    normalized = labels.astype(str).str.strip().str.lower()
+    mapped = normalized.map(LABEL2ID)
+    unknown = sorted(normalized[mapped.isna() & labels.notna()].unique())
+    if unknown:
+        raise ValueError(f"Unknown detector labels: {unknown}. Expected one of {sorted(LABEL2ID)}")
+    return mapped.astype("Int64")
+
+
+def extract_cn_features(df: pd.DataFrame) -> pd.DataFrame:
+    if "cn_value" not in df.columns:
+        return pd.DataFrame(index=df.index)
+
+    cn = df["cn_value"].fillna("").astype(str)
+    feats = pd.DataFrame(index=df.index)
+    feats["cn_len"] = cn.str.len()
+
+    tld = cn.str.split(".").str[-1].str.lower()
+    tld_counts = tld.value_counts()
+    common_tlds = tld_counts[tld_counts >= 5].index.tolist()
+    tld = tld.apply(lambda value: value if value in common_tlds else "other")
+    feats["cn_tld_encoded"] = LabelEncoder().fit_transform(tld)
+
+    def count_subdomains(domain: str) -> int:
+        parts = domain.split(".")
+        if parts and parts[-1] == "":
+            parts = parts[:-1]
+        return max(0, len(parts) - 1)
+
+    feats["cn_subdomain_count"] = cn.apply(count_subdomains)
+
+    ip_pattern = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+    feats["cn_has_ip"] = cn.apply(lambda value: 1 if ip_pattern.match(value) else 0)
+
+    def calc_entropy(text: str) -> float:
+        if not text:
+            return 0.0
+        counts = Counter(text)
+        probs = np.array(list(counts.values())) / len(text)
+        return float(entropy(probs, base=2))
+
+    feats["cn_entropy"] = cn.apply(calc_entropy)
+    feats["cn_is_www"] = cn.str.startswith("www.").astype(int)
+    feats["cn_digit_ratio_new"] = cn.apply(lambda text: sum(ch.isdigit() for ch in text) / max(len(text), 1))
+    feats["cn_has_hyphen"] = cn.str.contains("-").astype(int)
+    return feats
+
+
+def preprocess_detector_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if LABEL_COL in df.columns:
+        df[LABEL_COL] = normalize_label_series(df[LABEL_COL])
+
+    protected = set(id_columns(df) + ([LABEL_COL] if LABEL_COL in df.columns else []))
+    drop_cols = [col for col in DROP_COLS if col in df.columns and col not in protected]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
+    cn_feats = extract_cn_features(df)
+    if not cn_feats.empty:
+        df = pd.concat([df, cn_feats], axis=1)
+        if "cn_value" in df.columns:
+            df = df.drop(columns=["cn_value"])
+
+    non_num_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    non_num_cols = [col for col in non_num_cols if col not in protected]
+    for col in non_num_cols:
+        if df[col].nunique(dropna=False) < 50:
+            df[col] = LabelEncoder().fit_transform(df[col].astype(str))
         else:
-            model = joblib.load(path)
-        loaded[name] = model
-        print(f"模型已加载: {name} from {path}")
-    return loaded, scaler
+            df = df.drop(columns=[col])
 
-def predict_batch(model_dict, X):
-    """
-    返回字典，包含每个模型的预测标签、置信度（最大概率）以及平均投票结果。
-    """
-    n_samples = X.shape[0]
-    probs_dict = {}
-    for name, model in model_dict.items():
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(X)
-        elif name == "LightGBM":
-            # LightGBM Booster 的预测概率
-            proba = model.predict(X, raw_score=False)
-            if proba.ndim == 1:
-                # 尝试获取类别概率（可能需要 pred_leaf 等）
-                proba = model.predict(X, raw_score=False, pred_leaf=False)
-        elif name == "XGBoost":
-            import xgboost as xgb
-            dtest = xgb.DMatrix(X)
-            proba = model.predict(dtest)
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if num_cols and df[num_cols].isnull().any().any():
+        df[num_cols] = df[num_cols].fillna(df[num_cols].median(numeric_only=True))
+
+    return df
+
+
+def detector_feature_columns(df: pd.DataFrame) -> list[str]:
+    protected = set(id_columns(df) + ([LABEL_COL] if LABEL_COL in df.columns else []))
+    return [
+        col
+        for col in df.columns
+        if col not in protected and pd.api.types.is_numeric_dtype(df[col])
+    ]
+
+
+def save_feature_columns(feature_columns: list[str]) -> None:
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    FEATURE_COLUMNS_JSON.write_text(
+        json.dumps(feature_columns, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def save_lgb_model(model: lgb.Booster) -> None:
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(MODEL_PKL, "wb") as f:
+        pickle.dump(model, f)
+
+    with open(MODEL_PKL, "rb") as f:
+        loaded = pickle.load(f)
+    probe = np.random.rand(1, model.num_feature()).astype(np.float32)
+    loaded.predict(probe)
+
+    try:
+        model.save_model(str(MODEL_TXT), num_iteration=model.best_iteration)
+    except Exception as exc:
+        print(f"[WARN] Could not save LightGBM text backup: {exc}")
+
+
+def predict_in_batches(model: lgb.Booster, X: np.ndarray) -> np.ndarray:
+    chunks = []
+    best_iteration = getattr(model, "best_iteration", None)
+    for start in range(0, len(X), BATCH_SIZE):
+        batch = X[start : start + BATCH_SIZE]
+        if best_iteration:
+            proba = model.predict(batch, num_iteration=best_iteration)
         else:
-            raise ValueError(f"不支持的模型类型: {name}")
-        # 确保概率为二维 (n_samples, n_classes)
-        if proba.ndim == 1:
-            # 如果是单列，可能是回归或二分类，扩展为两列
-            if np.max(proba) > 1:  # 简单的启发式
-                pass
-            else:
-                proba = np.vstack([1 - proba, proba]).T
-        probs_dict[name] = proba
+            proba = model.predict(batch)
+        chunks.append(proba)
+    return np.vstack(chunks)
 
-    # 构建输出
-    results = {}
-    for name, proba in probs_dict.items():
-        pred = np.argmax(proba, axis=1)
-        conf = np.max(proba, axis=1)
-        results[f"pred_{name}"] = pred
-        results[f"conf_{name}"] = conf
 
-    if len(model_dict) > 1:
-        all_preds = [results[f"pred_{name}"] for name in model_dict]
-        vote_pred = np.apply_along_axis(lambda x: np.bincount(x).argmax(), axis=0,
-                                        arr=np.array(all_preds))
-        results["vote_pred"] = vote_pred
-        avg_proba = np.mean(list(probs_dict.values()), axis=0)
-        results["avg_conf"] = np.max(avg_proba, axis=1)
+def metrics_row(name: str, y_true, y_pred) -> list[float | str]:
+    return [
+        name,
+        accuracy_score(y_true, y_pred),
+        f1_score(y_true, y_pred, average="weighted"),
+        precision_score(y_true, y_pred, average="weighted", zero_division=0),
+        recall_score(y_true, y_pred, average="weighted", zero_division=0),
+    ]
 
-    return results, probs_dict
 
-# ====================== 前端数据生成 ======================
+def write_test_outputs(test_df: pd.DataFrame, y_test: np.ndarray, proba: np.ndarray) -> pd.DataFrame:
+    pred = np.argmax(proba, axis=1)
+    conf = np.max(proba, axis=1)
 
-def generate_frontend_assets(df, results, probs_dict, output_dir):
-    """
-    根据检测结果生成前端可视化所需的数据文件。
-    """
-    print("\n生成前端可视化数据...")
+    ids = id_columns(test_df)
+    out_df = test_df[ids].copy() if ids else pd.DataFrame(index=test_df.index)
+    out_df["true_label"] = y_test
+    out_df["true_label_name"] = pd.Series(y_test).map(ID2LABEL).fillna(pd.Series(y_test).astype(str))
+    out_df["pred_label"] = pred
+    out_df["pred_label_name"] = pd.Series(pred).map(ID2LABEL).fillna(pd.Series(pred).astype(str))
+    out_df["confidence"] = conf
 
-    # 1. 统计概览 (detection_summary.csv)
-    total = len(df)
-    vote_pred = results.get("vote_pred", results[list(results.keys())[0]])  # 默认用投票或第一个模型
-    # 统计各类别数量
-    class_counts = pd.Series(vote_pred).value_counts().to_dict()
-    # 假设类别 0 为良性，其他为恶意（可根据实际情况自定义）
-    benign_label = 0
-    malicious_count = sum(v for k, v in class_counts.items() if k != benign_label)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(OUTPUT_CSV, index=False)
+    out_df.to_csv(OUTPUT_DIR / "predictions.csv", index=False)
+
+    labels = sorted(ID2LABEL)
+    cm = confusion_matrix(y_test, pred, labels=labels)
+    pd.DataFrame(
+        cm,
+        index=[ID2LABEL[idx] for idx in labels],
+        columns=[ID2LABEL[idx] for idx in labels],
+    ).to_csv(OUTPUT_DIR / "confusion_matrix.csv")
+    plot_confusion_matrix(cm, labels, y_test, pred)
+
+    report = classification_report(
+        y_test,
+        pred,
+        labels=labels,
+        target_names=[ID2LABEL[idx] for idx in labels],
+        digits=4,
+        zero_division=0,
+    )
+    (OUTPUT_DIR / "classification_report.txt").write_text(report, encoding="utf-8")
+    print(report)
+    return out_df
+
+
+def plot_confusion_matrix(cm: np.ndarray, labels: list[int], y_test: np.ndarray, pred: np.ndarray) -> None:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    weighted_f1 = f1_score(y_test, pred, average="weighted")
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_for_color = np.divide(cm, row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums != 0)
+
+    plt.figure(figsize=(7.2, 5.8))
+    sns.heatmap(
+        cm_for_color,
+        annot=cm,
+        annot_kws={"fontsize": 10},
+        fmt="d",
+        cmap=CONFUSION_CMAP,
+        cbar=False,
+        xticklabels=labels,
+        yticklabels=labels,
+        linewidths=0.3,
+        linecolor="white",
+        vmin=0,
+        vmax=1,
+    )
+    plt.title(f"LightGBM (Weighted F1={weighted_f1:.3f})")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.tight_layout()
+    plt.savefig(REPORT_DIR / "confusion_matrix.png", dpi=200)
+    plt.close()
+
+
+def write_detection_assets(raw_test_df: pd.DataFrame, out_df: pd.DataFrame, proba: np.ndarray) -> None:
+    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+
+    pred = out_df["pred_label"].to_numpy()
     summary = {
-        "total_flows": total,
-        "predicted_benign": class_counts.get(benign_label, 0),
-        "predicted_malicious": malicious_count,
+        "total_flows": len(out_df),
+        "predicted_benign": int(np.sum(pred == BENIGN_LABEL)),
+        "predicted_malicious": int(np.sum(pred != BENIGN_LABEL)),
     }
-    # 详细类别计数（可列出所有类别）
-    for cls, cnt in class_counts.items():
-        summary[f"class_{cls}_count"] = cnt
-    pd.DataFrame([summary]).to_csv(os.path.join(output_dir, "detection_summary.csv"), index=False)
-    print("  - detection_summary.csv: 检测概览统计")
+    for label, count in pd.Series(pred).value_counts().sort_index().items():
+        summary[f"class_{label}_count"] = int(count)
+    pd.DataFrame([summary]).to_csv(ASSETS_DIR / "detection_summary.csv", index=False)
 
-    # 2. 风险分布 (每样本置信度)
-    risk_cols = [col for col in results if col.startswith("conf_") or col == "avg_conf"]
-    risk_df = df[ID_COLS].copy() if ID_COLS else pd.DataFrame(index=df.index)
-    for col in risk_cols:
-        risk_df[col] = results[col]
-    risk_df.to_csv(os.path.join(output_dir, "risk_distribution.csv"), index=False)
-    print("  - risk_distribution.csv: 每个流的置信度，用于直方图/箱线图")
+    risk_df = out_df[id_columns(out_df)].copy() if id_columns(out_df) else pd.DataFrame(index=out_df.index)
+    risk_df["confidence"] = out_df["confidence"]
+    risk_df["pred_label"] = out_df["pred_label"]
+    risk_df["pred_label_name"] = out_df["pred_label_name"]
+    risk_df.to_csv(ASSETS_DIR / "risk_distribution.csv", index=False)
 
-    # 3. 恶意流详情 (高置信恶意流)
-    # 使用平均置信度或投票结果
-    conf_key = "avg_conf" if "avg_conf" in results else next((c for c in results if c.startswith("conf_")), None)
-    is_mal = vote_pred != benign_label  # 预测为恶意
-    high_conf_mask = (results.get(conf_key, 0) > MALICIOUS_CONF_THRESHOLD)
-    malicious_idx = np.where(is_mal & high_conf_mask)[0]
-    if len(malicious_idx) > 0:
-        mal_df = df.iloc[malicious_idx].copy()
-        # 添加预测信息
-        for col in results:
-            if col.startswith("pred_") or col.startswith("conf_"):
-                # 确保对应的是标量而非数组
-                arr = results[col]
-                if isinstance(arr, np.ndarray):
-                    mal_df[col] = arr[malicious_idx]
-                elif isinstance(arr, list):
-                    mal_df[col] = np.array(arr)[malicious_idx]
-        mal_df.to_csv(os.path.join(output_dir, "malicious_details.csv"), index=False)
-    else:
-        pd.DataFrame(columns=df.columns).to_csv(os.path.join(output_dir, "malicious_details.csv"), index=False)
-    print("  - malicious_details.csv: 高置信恶意流详情，便于表格展示")
+    high_conf_mal = (out_df["pred_label"] != BENIGN_LABEL) & (
+        out_df["confidence"] >= MALICIOUS_CONF_THRESHOLD
+    )
+    details = pd.concat(
+        [
+            raw_test_df.loc[high_conf_mal].reset_index(drop=True),
+            out_df.loc[high_conf_mal].reset_index(drop=True),
+        ],
+        axis=1,
+    )
+    details.to_csv(ASSETS_DIR / "malicious_details.csv", index=False)
 
-    # 4. 趋势分析
-    if TIME_COL in df.columns and pd.api.types.is_numeric_dtype(df[TIME_COL]):
-        time_series = df[TIME_COL].values
-        # 按时间排序并划分窗口（例如每分钟或每10秒）
-        sort_idx = np.argsort(time_series)
-        sorted_df = df.iloc[sort_idx]
-        sorted_time = time_series[sort_idx]
-        sorted_pred = vote_pred[sort_idx] if isinstance(vote_pred, np.ndarray) else np.array(list(vote_pred))[sort_idx]
-        # 按固定时间窗口统计（简单起分10个区间）
-        bins = np.linspace(sorted_time.min(), sorted_time.max(), 11)
-        windows = pd.cut(sorted_time, bins=bins, labels=False, right=False)
-        trend_rows = []
-        for win in range(10):
-            mask = windows == win
-            total = mask.sum()
-            malicious = (sorted_pred[mask] != benign_label).sum() if total > 0 else 0
-            trend_rows.append({
-                "window_start": bins[win],
-                "window_end": bins[win+1],
-                "total": total,
-                "malicious": malicious
-            })
-        trend_df = pd.DataFrame(trend_rows)
-    else:
-        # 没有时间戳，按样本序号分段
-        total = len(df)
-        pred_arr = vote_pred if isinstance(vote_pred, np.ndarray) else np.array(list(vote_pred))
-        trend_rows = []
-        for start in range(0, total, TREND_WINDOW):
-            end = min(start + TREND_WINDOW, total)
-            segment = pred_arr[start:end]
-            trend_rows.append({
+    trend_rows = []
+    window = 100
+    for start in range(0, len(out_df), window):
+        end = min(start + window, len(out_df))
+        segment = pred[start:end]
+        trend_rows.append(
+            {
                 "sample_start": start,
                 "sample_end": end - 1,
                 "total": len(segment),
-                "malicious": int(np.sum(segment != benign_label))
-            })
-        trend_df = pd.DataFrame(trend_rows)
-    trend_df.to_csv(os.path.join(output_dir, "trend_data.csv"), index=False)
-    print("  - trend_data.csv: 按时间或序号分段的恶意流趋势")
+                "malicious": int(np.sum(segment != BENIGN_LABEL)),
+            }
+        )
+    pd.DataFrame(trend_rows).to_csv(ASSETS_DIR / "trend_data.csv", index=False)
 
-    # 5. 模型投票一致性
-    pred_cols = [col for col in results if col.startswith("pred_") and "vote" not in col]
-    if len(pred_cols) > 1:
-        vote_df = pd.DataFrame()
-        if ID_COLS:
-            vote_df[ID_COLS] = df[ID_COLS]
-        for col in pred_cols:
-            vote_df[col] = results[col]
-        vote_df.to_csv(os.path.join(output_dir, "vote_consistency.csv"), index=False)
-        print("  - vote_consistency.csv: 各模型预测标签，用于投票一致性分析")
+    feat_cols = [col for col in raw_test_df.columns if col.startswith("feat_")]
+    if feat_cols and len(raw_test_df) >= 2:
+        coords = PCA(n_components=2, random_state=SEED).fit_transform(
+            raw_test_df[feat_cols].fillna(0).to_numpy(np.float32)
+        )
+        latent = out_df[id_columns(out_df)].copy() if id_columns(out_df) else pd.DataFrame(index=out_df.index)
+        latent["x"] = coords[:, 0]
+        latent["y"] = coords[:, 1]
+        latent["pred_label"] = pred
+        latent.to_csv(ASSETS_DIR / "latent_2d.csv", index=False)
+
+    pd.DataFrame(proba, columns=[f"prob_{idx}" for idx in range(proba.shape[1])]).to_csv(
+        ASSETS_DIR / "class_probabilities.csv",
+        index=False,
+    )
+
+
+def write_weighted_metrics_plot(results_df: pd.DataFrame) -> None:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    plot_df = results_df.rename(columns={"F1": "Weighted F1"}).melt(
+        id_vars="Model",
+        value_vars=["Accuracy", "Precision", "Recall", "Weighted F1"],
+        var_name="Metric",
+        value_name="Score",
+    )
+    plt.figure(figsize=(13, 6.5))
+    ax = sns.barplot(data=plot_df, x="Model", y="Score", hue="Metric", palette=METRIC_PALETTE)
+    ax.set_ylim(0, 1.05)
+    ax.set_title("Weighted Metrics Comparison")
+    ax.set_xlabel("")
+    ax.set_ylabel("Score")
+    ax.tick_params(axis="x", rotation=20)
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.3f", fontsize=8, padding=2)
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.savefig(REPORT_DIR / "weighted_metrics_comparison.png", dpi=200)
+    plt.close()
+
+
+def write_roc_report(y_test: np.ndarray, proba_by_model: dict[str, np.ndarray]) -> None:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+    classes = np.array(sorted(ID2LABEL))
+    y_bin = label_binarize(y_test, classes=classes)
+    auc_rows = []
+
+    plt.figure(figsize=(10, 7))
+    for name, proba in proba_by_model.items():
+        if proba is None or proba.shape != y_bin.shape:
+            continue
+        if len(np.unique(y_bin.ravel())) <= 1:
+            continue
+
+        fpr, tpr, _ = roc_curve(y_bin.ravel(), proba.ravel())
+        auc_value = roc_auc_score(y_bin, proba, average="micro", multi_class="ovr")
+        auc_rows.append({"model": name, "micro_auc": auc_value})
+        linewidth = 2.8 if name == "LightGBM (ours)" else 1.8
+        linestyle = "--" if name == "LightGBM (ours)" else "-"
+        plt.plot(fpr, tpr, linewidth=linewidth, linestyle=linestyle, label=f"{name} micro AUC={auc_value:.3f}")
+
+    plt.plot([0, 1], [0, 1], color="gray", linestyle=":", linewidth=1.2)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("Classifier Micro-Average ROC Curves")
+    plt.legend(loc="lower right", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(REPORT_DIR / "roc_curve.png", dpi=200)
+    plt.close()
+
+    pd.DataFrame(auc_rows).to_csv(REPORT_DIR / "roc_auc_scores.csv", index=False)
+
+
+def evaluate_baselines(
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    lgb_pred,
+    lgb_proba,
+) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+    results = [metrics_row("LightGBM (ours)", y_test, lgb_pred)]
+    proba_by_model = {"LightGBM (ours)": lgb_proba}
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    baselines = {
+        "KNN (k=5)": (KNeighborsClassifier(n_neighbors=5), X_train_scaled, X_test_scaled),
+        "Decision Tree": (
+            DecisionTreeClassifier(max_depth=15, min_samples_leaf=5, random_state=SEED),
+            X_train,
+            X_test,
+        ),
+        "Logistic Regression": (
+            LogisticRegression(solver="saga", max_iter=300, n_jobs=-1, random_state=SEED),
+            X_train_scaled,
+            X_test_scaled,
+        ),
+        "Gaussian NB": (GaussianNB(), X_train, X_test),
+        "Random Forest": (
+            RandomForestClassifier(
+                n_estimators=100,
+                max_depth=20,
+                min_samples_leaf=5,
+                class_weight="balanced",
+                random_state=SEED,
+                n_jobs=-1,
+            ),
+            X_train,
+            X_test,
+        ),
+    }
+    if XGB_AVAILABLE:
+        baselines["XGBoost"] = (
+            XGBClassifier(
+                n_estimators=200,
+                learning_rate=0.1,
+                max_depth=6,
+                random_state=SEED,
+                eval_metric="mlogloss",
+                verbosity=0,
+                n_jobs=-1,
+            ),
+            X_train,
+            X_test,
+        )
     else:
-        print("  - 跳过多模型一致性（仅有一个模型）")
+        print("  [WARN] XGBoost is not installed; skip XGBoost baseline")
 
-    # 6. 降维可视化 (2D)
-    if USE_PCA_2D:
-        z_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
-        if z_cols:
-            X_z = df[z_cols].values.astype(np.float32)
-            pca = PCA(n_components=2, random_state=RANDOM_STATE)
-            ld2 = pca.fit_transform(X_z)
-            pca_df = df[ID_COLS].copy() if ID_COLS else pd.DataFrame(index=df.index)
-            pca_df["x"] = ld2[:, 0]
-            pca_df["y"] = ld2[:, 1]
-            # 添加投票预测标签
-            pca_df["pred_label"] = vote_pred
-            pca_df.to_csv(os.path.join(output_dir, "latent_2d.csv"), index=False)
-            print("  - latent_2d.csv: 2D 降维坐标及预测标签，可用于散点图")
-        else:
-            print("  - 未找到 z_ 特征列，跳过 2D 降维")
+    for name, (baseline, train_x, test_x) in baselines.items():
+        baseline.fit(train_x, y_train)
+        y_pred = baseline.predict(test_x)
+        results.append(metrics_row(name, y_test, y_pred))
+        if hasattr(baseline, "predict_proba"):
+            proba_by_model[name] = baseline.predict_proba(test_x)
 
-    print("所有前端数据文件已生成至:", output_dir)
+    results_df = pd.DataFrame(results, columns=["Model", "Accuracy", "F1", "Precision", "Recall"])
+    return results_df.sort_values(by="F1", ascending=False), proba_by_model
 
-# ====================== 主程序 ======================
 
 def main():
     print("=" * 60)
-    print(" 恶意加密流量检测（含前端数据导出）")
+    print(" LightGBM detector: train / validate / test")
     print("=" * 60)
 
-    # 1. 读取数据
-    print(f"\n[1/3] 读取输入 CSV: {INPUT_CSV}")
-    df = pd.read_csv(INPUT_CSV)
-    print(f"  原始形状: {df.shape}")
+    print(f"\n[1/5] Read fused features: {INPUT_CSV}")
+    raw_df = pd.read_csv(INPUT_CSV)
+    df = preprocess_detector_dataframe(raw_df)
+    if LABEL_COL not in df.columns:
+        raise ValueError(f"Detector stage requires a '{LABEL_COL}' column for train/test split")
 
-    # 提取特征列
-    feature_cols = [c for c in df.columns if c.startswith(FEATURE_PREFIX)]
+    feature_cols = detector_feature_columns(df)
     if not feature_cols:
-        raise ValueError(f"未找到以 '{FEATURE_PREFIX}' 开头的特征列。")
-    print(f"  检测到的特征列: {len(feature_cols)} 维")
-
-    # 确保标识列存在
-    id_cols_exist = [c for c in ID_COLS if c in df.columns]
-    if not id_cols_exist:
-        df["flow_uid"] = df.index.astype(str)
-        id_cols_exist = ["flow_uid"]
+        raise ValueError("No numeric detector features found")
+    save_feature_columns(feature_cols)
 
     X = df[feature_cols].values.astype(np.float32)
+    y = df[LABEL_COL].astype("int64").to_numpy()
+    print(f"  samples={len(X):,}, features={X.shape[1]}, classes={len(np.unique(y))}")
 
-    # 2. 加载模型
-    print(f"\n[2/3] 加载模型...")
-    models, scaler = load_models(MODEL_DIR, MODEL_FILES, ACTIVE_MODELS)
-    if not models:
-        print("错误：没有成功加载任何模型，退出。")
-        return
+    print("\n[2/5] Split features into train / val / test")
+    indices = np.arange(len(df))
+    train_val_idx, test_idx, y_train_val, y_test = train_test_split(
+        indices,
+        y,
+        test_size=TEST_SIZE,
+        random_state=SEED,
+        stratify=y,
+    )
+    train_idx, val_idx, y_train_lgb, y_val_lgb = train_test_split(
+        train_val_idx,
+        y_train_val,
+        test_size=VAL_SIZE_WITHIN_TRAIN,
+        random_state=SEED,
+        stratify=y_train_val,
+    )
 
-    if scaler is not None:
-        X = scaler.transform(X)
+    X_train_lgb = X[train_idx]
+    X_val_lgb = X[val_idx]
+    X_test = X[test_idx]
+    X_train_baseline = X[train_val_idx]
 
-    # 3. 推理
-    print(f"\n[3/3] 执行推理...")
-    all_results = {}
-    all_probs = None   # 暂存概率，如果只需要结果可以不存全部概率，但为了前端我们可能不需要，这里略
-    start_idx = 0
-    while start_idx < len(X):
-        end_idx = min(start_idx + BATCH_SIZE, len(X))
-        X_batch = X[start_idx:end_idx]
-        batch_res, batch_probs = predict_batch(models, X_batch)
-        for key, val in batch_res.items():
-            if key not in all_results:
-                all_results[key] = []
-            all_results[key].extend(val if isinstance(val, (list, np.ndarray)) else [val])
-        start_idx = end_idx
+    print(
+        "  split ratio: "
+        f"train={len(train_idx) / len(df):.1%}, "
+        f"val={len(val_idx) / len(df):.1%}, "
+        f"test={len(test_idx) / len(df):.1%}"
+    )
 
-    # 组装最终检测结果 DataFrame
-    out_df = df[id_cols_exist].copy()
-    for col_name, col_data in all_results.items():
-        out_df[col_name] = col_data
+    print("\n[3/5] Train LightGBM")
+    sample_weights = compute_sample_weight(class_weight="balanced", y=y_train_lgb)
+    dtrain = lgb.Dataset(X_train_lgb, label=y_train_lgb, weight=sample_weights)
+    dval = lgb.Dataset(X_val_lgb, label=y_val_lgb, reference=dtrain)
 
-    # 保存原始检测结果
-    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
-    out_df.to_csv(OUTPUT_CSV, index=False)
-    print(f"检测结果已保存至: {OUTPUT_CSV}")
+    params = {
+        "objective": "multiclass",
+        "num_class": len(np.unique(y)),
+        "metric": "multi_logloss",
+        "boosting_type": "gbdt",
+        "num_leaves": 63,
+        "learning_rate": 0.03,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "min_data_in_leaf": 50,
+        "lambda_l1": 0.1,
+        "lambda_l2": 0.1,
+        "verbose": -1,
+        "seed": SEED,
+        "n_jobs": -1,
+    }
+    model = lgb.train(
+        params,
+        dtrain,
+        num_boost_round=2000,
+        valid_sets=[dval],
+        callbacks=[
+            lgb.early_stopping(100, verbose=False),
+            lgb.log_evaluation(100),
+        ],
+    )
+    save_lgb_model(model)
+    print(f"  best_iteration={model.best_iteration}")
+    print(f"  model={MODEL_PKL}")
+    print(f"  feature_columns={FEATURE_COLUMNS_JSON}")
 
-    # 生成前端可视化数据
-    # 注意：为了生成这些数据，我们需要 results 字典（全局）和 probs 字典（可选），
-    # 函数 generate_frontend_assets 内部会使用 all_results 和 df。
-    # 传递精简的概率数据可能不需要，我们可忽略 probs 参数。
-    generate_frontend_assets(df, all_results, None, OUTPUT_DIR)
+    print("\n[4/5] Test-set inference")
+    proba = predict_in_batches(model, X_test)
+    pred = np.argmax(proba, axis=1)
+    test_raw_df = raw_df.iloc[test_idx].reset_index(drop=True)
+    test_processed_df = df.iloc[test_idx].reset_index(drop=True)
+    out_df = write_test_outputs(test_processed_df, y_test, proba)
+    write_detection_assets(test_raw_df, out_df, proba)
+    print(f"  results={OUTPUT_CSV}")
+    print(f"  assets={ASSETS_DIR}")
 
-    print("\n全部任务完成！")
+    print("\n[5/5] Baseline comparison")
+    results_df, proba_by_model = evaluate_baselines(
+        X_train_baseline,
+        X_test,
+        y_train_val,
+        y_test,
+        pred,
+        proba,
+    )
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = REPORT_DIR / "model_comparison_with_baselines.csv"
+    results_df.to_csv(report_path, index=False)
+    write_weighted_metrics_plot(results_df)
+    write_roc_report(y_test, proba_by_model)
+    print(results_df.to_string(index=False))
+    print(f"  report={report_path}")
+    print(f"  confusion_matrix_png={REPORT_DIR / 'confusion_matrix.png'}")
+    print(f"  weighted_metrics_png={REPORT_DIR / 'weighted_metrics_comparison.png'}")
+    print(f"  roc={REPORT_DIR / 'roc_curve.png'}")
+
+    return model, results_df
+
 
 if __name__ == "__main__":
     main()
