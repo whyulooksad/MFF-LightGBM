@@ -51,8 +51,11 @@ from pipeline.config import (
     FEATURES_FUSED_CSV,
     PIPELINE_OUTPUT_DIR,
     ROOT,
+    REDUCED_FEATURES_CSV,
+    SUPCON_MODEL_PATH,
 )
 from pipeline.pca_reduce_features import reduce_feat_in_memory
+from pipeline.supcon_ae import SupConAEReducer, replace_semantic_features, semantic_feature_columns
 
 
 warnings.filterwarnings("ignore")
@@ -524,29 +527,25 @@ def evaluate_baselines(
     return results_df.sort_values(by="F1", ascending=False), proba_by_model
 
 
-def main(n_components: int = 64):
+def main(
+    n_components: int = 64,
+    reducer_name: str = "supcon",
+    supcon_config: dict | None = None,
+    run_baselines: bool = True,
+):
     print("=" * 60)
     print(" LightGBM detector: train / validate / test")
     print("=" * 60)
 
-    print(f"\n[1/5] Read fused features: {INPUT_CSV}")
+    print(f"\n[1/6] Read fused features: {INPUT_CSV}")
     raw_df = pd.read_csv(INPUT_CSV)
-    print(f"      PCA 降维 feat_*: 768 -> {n_components} 维 (manual 原样保留)")
-    raw_df = reduce_feat_in_memory(raw_df, n_components=n_components, seed=SEED)
     df = preprocess_detector_dataframe(raw_df)
     if LABEL_COL not in df.columns:
         raise ValueError(f"Detector stage requires a '{LABEL_COL}' column for train/test split")
-
-    feature_cols = detector_feature_columns(df)
-    if not feature_cols:
-        raise ValueError("No numeric detector features found")
-    save_feature_columns(feature_cols)
-
-    X = df[feature_cols].values.astype(np.float32)
     y = df[LABEL_COL].astype("int64").to_numpy()
-    print(f"  samples={len(X):,}, features={X.shape[1]}, classes={len(np.unique(y))}")
+    print(f"  samples={len(df):,}, raw_features={len(detector_feature_columns(df))}, classes={len(np.unique(y))}")
 
-    print("\n[2/5] Split features into train / val / test")
+    print("\n[2/6] Split train / validation / test before supervised reduction")
     indices = np.arange(len(df))
     train_val_idx, test_idx, y_train_val, y_test = train_test_split(
         indices,
@@ -563,6 +562,41 @@ def main(n_components: int = 64):
         stratify=y_train_val,
     )
 
+    print("\n[3/6] Reduce DeBERTa semantic features")
+    if reducer_name == "supcon":
+        semantic_cols = semantic_feature_columns(df)
+        if not semantic_cols:
+            raise ValueError("No feat_* semantic columns found for SupCon-AE")
+        semantic_values = df[semantic_cols].to_numpy(np.float32)
+        reducer = SupConAEReducer(config=supcon_config, verbose=True)
+        reducer.fit(
+            semantic_values[train_idx],
+            y[train_idx],
+            semantic_values[val_idx],
+            y[val_idx],
+            feature_columns=semantic_cols,
+            checkpoint_path=SUPCON_MODEL_PATH,
+        )
+        df = replace_semantic_features(df, reducer)
+        df.to_csv(REDUCED_FEATURES_CSV, index=False)
+        print(
+            f"  SupCon-AE: {len(semantic_cols)} -> {reducer.config['latent_dim']} dimensions; "
+            f"checkpoint={SUPCON_MODEL_PATH}"
+        )
+        print(f"  reduced_features={REDUCED_FEATURES_CSV}")
+    elif reducer_name == "pca":
+        print(f"  PCA: feat_* -> {n_components} dimensions")
+        df = reduce_feat_in_memory(df, n_components=n_components, seed=SEED)
+    elif reducer_name != "none":
+        raise ValueError(f"Unknown reducer: {reducer_name}")
+
+    feature_cols = detector_feature_columns(df)
+    if not feature_cols:
+        raise ValueError("No numeric detector features found")
+    save_feature_columns(feature_cols)
+    X = df[feature_cols].values.astype(np.float32)
+    print(f"  detector_features={X.shape[1]}")
+
     X_train_lgb = X[train_idx]
     X_val_lgb = X[val_idx]
     X_test = X[test_idx]
@@ -575,7 +609,7 @@ def main(n_components: int = 64):
         f"test={len(test_idx) / len(df):.1%}"
     )
 
-    print("\n[3/5] Train LightGBM")
+    print("\n[4/6] Train LightGBM")
     sample_weights = compute_sample_weight(class_weight="balanced", y=y_train_lgb)
     dtrain = lgb.Dataset(X_train_lgb, label=y_train_lgb, weight=sample_weights)
     dval = lgb.Dataset(X_val_lgb, label=y_val_lgb, reference=dtrain)
@@ -612,7 +646,7 @@ def main(n_components: int = 64):
     print(f"  model={MODEL_PKL}")
     print(f"  feature_columns={FEATURE_COLUMNS_JSON}")
 
-    print("\n[4/5] Test-set inference")
+    print("\n[5/6] Test-set inference")
     proba = predict_in_batches(model, X_test)
     pred = np.argmax(proba, axis=1)
     test_raw_df = raw_df.iloc[test_idx].reset_index(drop=True)
@@ -622,15 +656,22 @@ def main(n_components: int = 64):
     print(f"  results={OUTPUT_CSV}")
     print(f"  assets={ASSETS_DIR}")
 
-    print("\n[5/5] Baseline comparison")
-    results_df, proba_by_model = evaluate_baselines(
-        X_train_baseline,
-        X_test,
-        y_train_val,
-        y_test,
-        pred,
-        proba,
-    )
+    print("\n[6/6] Baseline comparison")
+    if run_baselines:
+        results_df, proba_by_model = evaluate_baselines(
+            X_train_baseline,
+            X_test,
+            y_train_val,
+            y_test,
+            pred,
+            proba,
+        )
+    else:
+        results_df = pd.DataFrame(
+            [metrics_row("LightGBM (ours)", y_test, pred)],
+            columns=["Model", "Accuracy", "F1", "Precision", "Recall"],
+        )
+        proba_by_model = {"LightGBM (ours)": proba}
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     report_path = REPORT_DIR / "model_comparison_with_baselines.csv"
     results_df.to_csv(report_path, index=False)
@@ -648,7 +689,13 @@ def main(n_components: int = 64):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="LightGBM detector (PCA 降维版)")
-    parser.add_argument("--n-components", type=int, default=64, help="PCA 目标维度,默认 64")
+    parser = argparse.ArgumentParser(description="LightGBM detector with semantic feature reduction")
+    parser.add_argument("--reducer", choices=["supcon", "pca", "none"], default="supcon")
+    parser.add_argument("--n-components", type=int, default=64, help="PCA target dimension")
+    parser.add_argument("--skip-baselines", action="store_true")
     args = parser.parse_args()
-    main(n_components=args.n_components)
+    main(
+        n_components=args.n_components,
+        reducer_name=args.reducer,
+        run_baselines=not args.skip_baselines,
+    )

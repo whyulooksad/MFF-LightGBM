@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>上传 PCAP · MFF-LightGBM</title>
+  <link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+
+  <div class="main">
+    <div class="page-header">
+      <div class="breadcrumb">检测任务 / <span>上传 PCAP</span></div>
+      <h1>上传 PCAP · 实时分析</h1>
+      <div class="subtitle">支持 .pcap / .pcapng 格式，通过 SSE 流式推送处理进度，整个过程无需解密通信内容。</div>
+    </div>
+
+    <!-- 上方两栏：上传区 + 处理管线 -->
+    <div class="grid grid-1-2 mb-24">
+      <!-- 左侧：上传区 -->
+      <div class="card">
+        <div class="card-title">
+          <span class="accent"></span>
+          上传文件
+        </div>
+
+        <!-- 模式切换 -->
+        <div class="mode-toggle">
+          <label><input type="radio" name="mode" value="real_test" checked> 测试集 pcap</label>
+          <label><input type="radio" name="mode" value="demo"> 使用示例数据演示</label>
+        </div>
+
+        <div class="upload-zone" id="dropZone">
+          <div class="upload-icon">📥</div>
+          <h3>点击或拖拽 PCAP 文件到此</h3>
+          <div class="hint">支持 .pcap · .pcapng；测试文件名需以八类标签之一开头</div>
+          <input type="file" id="fileInput" accept=".pcap,.pcapng" style="display:none;">
+        </div>
+
+        <div class="mt-16">
+          <button class="btn btn-primary w-full" id="selectFileBtn">↑ 选择文件</button>
+          <button class="btn btn-primary w-full mt-16" id="startBtn">▶ 开始分析</button>
+        </div>
+
+        <div id="fileInfo" style="margin-top:16px; padding:12px; background:var(--bg-elevated); border-radius:6px; display:none;">
+          <div class="flex items-center gap-8 mb-16">
+            <span class="tag tag-success">✓ 已就绪</span>
+            <span class="text-sm text-secondary" id="fileName">-</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右侧：处理管线 -->
+      <div class="card">
+        <div class="card-title">
+          <span class="accent"></span>
+          实时处理管线
+          <span class="card-title-extra">
+            <span class="tag tag-primary">SSE</span>
+            <span class="text-tertiary ml-8" id="elapsed">等待开始</span>
+          </span>
+        </div>
+
+        <div class="pipeline">
+          <div class="pipeline-step pending">
+            <div class="pipeline-icon">1</div>
+            <div class="pipeline-body">
+              <div class="pipeline-title">PCAP 截断</div>
+              <div class="pipeline-desc">按会话截断、过滤无效包</div>
+              <div class="pipeline-meta">等待开始</div>
+              <div class="progress mt-8">
+                <div class="progress-fill" style="width:0%;"></div>
+              </div>
+            </div>
+          </div>
+          <div class="pipeline-step pending">
+            <div class="pipeline-icon">2</div>
+            <div class="pipeline-body">
+              <div class="pipeline-title">人工特征提取</div>
+              <div class="pipeline-desc">流统计特征：包长/时间间隔/字节分布等</div>
+              <div class="pipeline-meta">等待开始</div>
+              <div class="progress mt-8">
+                <div class="progress-fill" style="width:0%;"></div>
+              </div>
+            </div>
+          </div>
+          <div class="pipeline-step pending">
+            <div class="pipeline-icon">3</div>
+            <div class="pipeline-body">
+              <div class="pipeline-title">日志序列化</div>
+              <div class="pipeline-desc">将握手/会话信息编码为 token 序列</div>
+              <div class="pipeline-meta">等待开始</div>
+              <div class="progress mt-8">
+                <div class="progress-fill" style="width:0%;"></div>
+              </div>
+            </div>
+          </div>
+          <div class="pipeline-step pending">
+            <div class="pipeline-icon">4</div>
+            <div class="pipeline-body">
+              <div class="pipeline-title">DeBERTa + 融合</div>
+              <div class="pipeline-desc">语义编码并与人工特征融合</div>
+              <div class="pipeline-meta">等待开始</div>
+              <div class="progress mt-8">
+                <div class="progress-fill" style="width:0%;"></div>
+              </div>
+            </div>
+          </div>
+          <div class="pipeline-step pending">
+            <div class="pipeline-icon">5</div>
+            <div class="pipeline-body">
+              <div class="pipeline-title">LightGBM 检测</div>
+              <div class="pipeline-desc">基于融合特征输出威胁判定</div>
+              <div class="pipeline-meta">等待开始</div>
+              <div class="progress mt-8">
+                <div class="progress-fill" style="width:0%;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex justify-between items-center">
+      <div class="text-tertiary text-sm">分析完成后将自动跳转至检测结果页</div>
+      <div class="flex gap-12">
+        <a class="btn btn-primary" href="detection.html">查看检测结果 →</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="shared/real-data.js"></script>
+  <script>
+    document.getElementById('topbar').innerHTML = renderTopbar();
+    document.getElementById('sidebar').innerHTML = renderSidebar('upload');
+
+    const fileInput = document.getElementById('fileInput');
+    const selectFileBtn = document.getElementById('selectFileBtn');
+    const startBtn = document.getElementById('startBtn');
+    const fileInfo = document.getElementById('fileInfo');
+    const fileName = document.getElementById('fileName');
+
+    // 选择文件
+    selectFileBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length > 0) {
+        fileInfo.style.display = 'block';
+        fileName.textContent = fileInput.files[0].name;
+      }
+    });
+
+    // 模式切换：demo 时禁用文件选择
+    document.querySelectorAll('input[name=mode]').forEach(radio => {
+      radio.addEventListener('change', () => {
+        const mode = document.querySelector('input[name=mode]:checked').value;
+        const disabled = mode === 'demo';
+        selectFileBtn.disabled = disabled;
+        fileInput.disabled = disabled;
+        if (disabled) {
+          fileInfo.style.display = 'none';
+          fileInput.value = '';
+        }
+      });
+    });
+
+    async function startAnalysis() {
+      const mode = document.querySelector('input[name=mode]:checked').value;
+      const fd = new FormData();
+      fd.append('mode', mode);
+      if (mode !== 'demo') {
+        fd.append('file', fileInput.files[0]);
+      }
+      const r = await fetch(`${API_BASE}/api/analyze`, {method: 'POST', body: fd});
+      const data = await r.json();
+      if (!r.ok || !data.task_id) {
+        alert('启动失败: ' + (data.detail || r.status));
+        return;
+      }
+      streamTaskProgress(data.task_id, {
+        onEvent: (evtName, data) => updatePipelineUI(evtName, data),
+        onDone: (evtName, data) => {
+          if (evtName === 'task_done') window.location.href = data.redirect || 'detection.html';
+        }
+      });
+    }
+
+    function updatePipelineUI(evtName, data) {
+      if (data.stage) {
+        const step = document.querySelectorAll('.pipeline-step')[data.stage - 1];
+        if (evtName === 'stage_start') step.className = 'pipeline-step active';
+        if (evtName === 'stage_done') step.className = 'pipeline-step done';
+        if (evtName === 'stage_progress' && data.progress != null) {
+          step.querySelector('.progress-fill').style.width = `${data.progress * 100}%`;
+        }
+        if (data.log) step.querySelector('.pipeline-meta').textContent = data.log;
+      }
+    }
+
+    startBtn.addEventListener('click', startAnalysis);
+  </script>
+</body>
+</html>

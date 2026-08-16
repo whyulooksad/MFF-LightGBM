@@ -1,38 +1,63 @@
-# Python cache/build artifacts
+# Python bytecode and caches
 __pycache__/
+*.py[cod]
+*$py.class
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.hypothesis/
+.ipynb_checkpoints/
+
+# Coverage
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
-*.py[cod]
-*$py.class
+
+# Build and packaging artifacts
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+.eggs/
 
 # Virtual environments
 .venv/
 venv/
 env/
 
-# Local environment
+# Local environment and tool configuration
 .env
 .env.*
 !.env.example
 .python-version
+.cache/
 
-# IDE / OS
+# IDE and operating-system files
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+Desktop.ini
 
-# Model weights and training checkpoints
-models/
-checkpoints/
-hf_cache/
+# Local agent state
+.agents/
+.codex/
+
+# Web application runtime state
+/app/tasks.db
+/app/tasks.db-*
+/app/*.sqlite
+/app/*.sqlite3
+
+# Large datasets and generated pipeline outputs
+/data/
+/data_example/
+
+# Local model weights and training checkpoints
+/models/
+/checkpoints/
+/hf_cache/
 *.pt
 *.pth
 *.ckpt
@@ -41,44 +66,55 @@ hf_cache/
 *.onnx
 *.h5
 *.ot
-
-# Data and generated feature files
-data/
-data_example/
-*.csv
-*.tsv
-*.jsonl
-*.parquet
-*.feather
-*.npy
-*.npz
 *.pkl
 *.pickle
+*.npy
+*.npz
+*.parquet
+*.feather
+
+# Packet captures
 *.pcap
 *.pcapng
 
-# Reports, private notes, and office temp files
-docs/
-memory/
+# Experiment trackers and logs
+/runs/
+/wandb/
+/mlruns/
+/outputs/
+/logs/
+*.log
+
+# Generated legacy experiment figures/data
+/legacy/**/*.png
+/legacy/**/*.jpg
+/legacy/**/*.jpeg
+/legacy/**/*.svg
+/legacy/**/*.csv
+/legacy/**/*.tsv
+/legacy/**/*.jsonl
+
+# Private reports and working notes
+/docs/
+
+# Unused frontend reference screenshots (the actual UI source is tracked)
+/frontend/*.png
+/frontend/*.jpg
+/frontend/*.jpeg
+
+# Binary reports and office temporary files
 *.pdf
 *.docx
 *.pptx
 *.xlsx
 ~$*
 
-# Experiment outputs
-runs/
-wandb/
-mlruns/
-outputs/
-logs/
-*.log
-*.png
-*.jpg
-*.jpeg
-*.svg
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
 
-# Local agent/app state
-.agents/
-
-damn/
+# Project-local scratch directory
+/damn/

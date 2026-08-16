@@ -1,28 +1,36 @@
 [project]
-name = "task2-deberta"
+name = "encrypted-traffic-detection"
 version = "0.1.0"
-description = "Task 2: DeBERTa-v3-base pre-training + LoRA fine-tuning for traffic feature extraction"
+description = "Encrypted traffic detection pipeline with a FastAPI demonstration frontend"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate",
     "datasets",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.1",
     "joblib",
     "lightgbm",
     "matplotlib",
     "pandas",
     "peft",
+    "psutil",
     "protobuf>=7.35.1",
     "scikit-learn",
     "scipy",
     "seaborn",
     "sentencepiece>=0.2.1",
     "safetensors>=0.4.0",
+    "sse-starlette>=3.4.5",
     "torch>=2.5.1",
     "torchaudio>=2.5.1",
     "torchvision>=0.20.1",
     "tqdm",
     "transformers",
+    "python-multipart>=0.0.20",
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.0.0",
+    "uvicorn[standard]>=0.34.0",
     "xgboost",
 ]
 

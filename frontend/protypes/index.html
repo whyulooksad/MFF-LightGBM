@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Dashboard · MFF-LightGBM 异常加密流量检测模型</title>
+  <link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+
+  <div class="main">
+    <!-- Hero 区 -->
+    <div class="hero">
+      <h1>MFF-LightGBM：基于多维特征融合的异常加密流量检测模型</h1>
+      <p>基于 DeBERTa-v3 与 LightGBM 的恶意加密流量检测算法——在不解密通信内容的前提下，融合流量统计特征与 TLS/X509 行为语义特征，实现正常流量、广告软件、DNS 隧道、勒索软件等八类加密流量检测。</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="upload.html">↑ 上传 PCAP 开始检测</a>
+        <a class="btn btn-ghost" href="detection.html">查看模型评估</a>
+      </div>
+    </div>
+
+    <!-- 关键指标（inline，真实数据） -->
+    <div class="metrics-inline" id="dashboardMetrics">
+      <!-- JS 注入 -->
+    </div>
+
+    <!-- 算法管线 Pipeline（5 节点） -->
+    <div class="card mb-24">
+      <div class="card-title">
+        <span class="accent"></span>
+        算法管线 Pipeline
+        <span class="card-title-extra">PCAP → 检测全流程</span>
+      </div>
+      <div class="algo-pipeline">
+        <div class="algo-node">
+          <div class="algo-stage">01</div>
+          <div class="algo-title">PCAP 截断</div>
+          <div class="algo-script mono">truncate_pcap.py</div>
+        </div>
+        <div class="algo-arrow">→</div>
+        <div class="algo-node">
+          <div class="algo-stage">02</div>
+          <div class="algo-title">人工特征提取</div>
+          <div class="algo-script mono">extract_flow_features.py</div>
+        </div>
+        <div class="algo-arrow">→</div>
+        <div class="algo-node">
+          <div class="algo-stage">03</div>
+          <div class="algo-title">日志序列化</div>
+          <div class="algo-script mono">preprocess.py</div>
+        </div>
+        <div class="algo-arrow">→</div>
+        <div class="algo-node">
+          <div class="algo-stage">04</div>
+          <div class="algo-title">DeBERTa-v3 + LoRA</div>
+          <div class="algo-script mono">extract_features.py</div>
+        </div>
+        <div class="algo-arrow">→</div>
+        <div class="algo-node">
+          <div class="algo-stage">05</div>
+          <div class="algo-title">SupCon-AE 降维</div>
+          <div class="algo-script mono">supcon_ae.py</div>
+        </div>
+        <div class="algo-arrow">→</div>
+        <div class="algo-node">
+          <div class="algo-stage">06</div>
+          <div class="algo-title">LightGBM 检测</div>
+          <div class="algo-script mono">pipeline/detector.py</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 最近任务（来自 /api/tasks） -->
+    <div class="card">
+      <div class="card-title">
+        <span class="accent"></span>
+        最近任务
+        <span class="card-title-extra">实时来自后端 SQLite</span>
+      </div>
+      <div class="table-wrapper">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>任务 ID</th>
+              <th>模式</th>
+              <th>状态</th>
+              <th>开始时间</th>
+            </tr>
+          </thead>
+          <tbody id="recentTasks"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="shared/real-data.js"></script>
+  <script>
+    document.getElementById('topbar').innerHTML = renderTopbar();
+    document.getElementById('sidebar').innerHTML = renderSidebar('dashboard');
+    registerDarkTheme();
+
+    // 关键指标：测试集样本数 / 类别数 / LightGBM Macro F1
+    fetchDashboard().then(d => {
+      document.getElementById('dashboardMetrics').innerHTML = `
+        <div class="metric-inline">
+          <div class="metric-label">测试集样本数</div>
+          <div class="metric-value mono">${d.test_samples.toLocaleString()}</div>
+        </div>
+        <div class="metric-inline">
+          <div class="metric-label">类别数</div>
+          <div class="metric-value mono">${d.num_classes}</div>
+        </div>
+        <div class="metric-inline">
+          <div class="metric-label">LightGBM Macro F1</div>
+          <div class="metric-value mono">${d.macro_f1.toFixed(4)}</div>
+        </div>
+      `;
+    });
+
+    // 最近任务列表
+    fetchTasks(5).then(tasks => {
+      document.getElementById('recentTasks').innerHTML = tasks.map(t => `
+        <tr>
+          <td class="mono">${t.task_id}</td>
+          <td>${t.mode}</td>
+          <td><span class="tag tag-${t.status === 'done' ? 'success' : 'warning'}">${t.status}</span></td>
+          <td class="mono">${t.started_at}</td>
+        </tr>
+      `).join('');
+    });
+  </script>
+</body>
+</html>

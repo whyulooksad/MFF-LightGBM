@@ -65,16 +65,9 @@ def main():
         action="store_true",
         help="When --stage all is used, start from existing pcap files in data/pcap/truncated.",
     )
-    parser.add_argument(
-        "--use-supcon",
-        action="store_true",
-        help="When --stage all is used, run optional SupCon-AE between feature extraction and detector.",
-    )
     args = parser.parse_args()
 
     stages = list(DEFAULT_PIPELINE_STAGES) if args.stage == "all" else [args.stage]
-    if args.stage == "all" and args.use_supcon:
-        stages.insert(stages.index("detector"), "supcon")
     if args.skip_truncate and args.stage == "all":
         stages = [stage for stage in stages if stage != "truncate"]
 

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>告警 / 任务管理 · MFF-LightGBM</title>
+  <link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+
+  <div class="main">
+    <div class="page-header">
+      <div class="breadcrumb">运营管理 / <span>告警 / 任务</span></div>
+      <h1>告警与任务管理</h1>
+      <div class="subtitle">查看加密流量检测任务执行状态与历史，跟踪任务运行情况。</div>
+    </div>
+
+    <!-- 摘要卡：3 列 inline -->
+    <div class="metrics-inline" id="alarmSummary"></div>
+
+    <!-- 任务历史表 -->
+    <div class="card">
+      <div class="card-title">
+        <span class="accent"></span>
+        任务历史
+        <span class="card-title-extra" id="taskCount"></span>
+      </div>
+      <div class="table-wrapper">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>任务 ID</th>
+              <th>模式</th>
+              <th>状态</th>
+              <th>开始时间</th>
+              <th>完成时间</th>
+              <th>PCAP 文件</th>
+            </tr>
+          </thead>
+          <tbody id="taskTable">
+            <tr><td colspan="6" class="text-tertiary text-center">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="shared/real-data.js"></script>
+  <script>
+    document.getElementById('topbar').innerHTML = renderTopbar();
+    document.getElementById('sidebar').innerHTML = renderSidebar('alarms');
+
+    fetchTasks(100).then(tasks => {
+      const running = tasks.filter(t => t.status === 'running').length;
+      const done = tasks.filter(t => t.status === 'done').length;
+
+      document.getElementById('alarmSummary').innerHTML = `
+        <div class="metric-inline"><div class="label">处理中</div><div class="value mono">${running}</div></div>
+        <div class="metric-inline"><div class="label">已完成</div><div class="value mono">${done}</div></div>
+        <div class="metric-inline"><div class="label">任务总数</div><div class="value mono">${tasks.length}</div></div>
+      `;
+
+      const countEl = document.getElementById('taskCount');
+      if (countEl) countEl.textContent = `共 ${tasks.length} 条`;
+
+      document.getElementById('taskTable').innerHTML = tasks.length === 0
+        ? '<tr><td colspan="6" class="text-tertiary text-center">暂无任务记录</td></tr>'
+        : tasks.map(t => `
+          <tr>
+            <td class="mono">${t.task_id}</td>
+            <td>${t.mode ?? '-'}</td>
+            <td><span class="tag tag-${t.status === 'done' ? 'success' : t.status === 'running' ? 'warning' : 'default'}">${t.status}</span></td>
+            <td class="mono">${t.started_at ?? '-'}</td>
+            <td class="mono">${t.finished_at ?? '-'}</td>
+            <td>${t.pcap_filename ?? '-'}</td>
+          </tr>
+        `).join('');
+    }).catch(err => {
+      document.getElementById('taskTable').innerHTML =
+        '<tr><td colspan="6" class="text-danger text-center">加载失败：' + (err && err.message ? err.message : err) + '</td></tr>';
+    });
+  </script>
+</body>
+</html>

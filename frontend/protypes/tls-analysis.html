@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>TLS 行为分析 · MFF-LightGBM</title>
+  <link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+
+  <div class="main">
+    <div class="page-header">
+      <div class="breadcrumb">检测任务 / <span>TLS 行为分析</span></div>
+      <h1>TLS 行为分析</h1>
+      <div class="subtitle">在不解密通信内容的前提下，基于元数据、TLS 日志解析与包时序行为刻画会话画像。</div>
+    </div>
+
+    <!-- 左右分栏：列表 + 详情 -->
+    <div class="grid grid-2-1">
+      <!-- 左侧：会话列表 -->
+      <div class="card">
+        <div class="card-title">
+          <span class="accent"></span>
+          会话列表
+          <span class="card-title-extra">最近 50 条</span>
+        </div>
+        <div class="table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>flow_uid</th>
+                <th>src_ip</th>
+                <th>dst_ip</th>
+                <th>SNI</th>
+                <th>duration</th>
+              </tr>
+            </thead>
+            <tbody id="flowList"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 右侧：会话详情 -->
+      <div class="card" id="flowDetail">
+        <div class="empty-state">选择左侧 flow 查看详情</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="shared/real-data.js"></script>
+  <script>
+    document.getElementById('topbar').innerHTML = renderTopbar();
+    document.getElementById('sidebar').innerHTML = renderSidebar('tls');
+
+    // 列表加载：拉取 50 条元数据
+    fetchMetadata(50, 0).then(rows => {
+      const list = Array.isArray(rows) ? rows : (rows.items || rows.data || []);
+      document.getElementById('flowList').innerHTML = list.map(r => `
+        <tr onclick="loadDetail('${r.flow_uid}')" style="cursor:pointer">
+          <td class="mono">${r.flow_uid}</td>
+          <td class="mono">${r.src_ip}</td>
+          <td class="mono">${r.dst_ip}</td>
+          <td class="mono">${r.sni || r.server_name || '-'}</td>
+          <td class="mono">${Number(r.duration || 0).toFixed(2)}s</td>
+        </tr>
+      `).join('');
+    }).catch(err => {
+      document.getElementById('flowList').innerHTML =
+        `<tr><td colspan="5" class="text-tertiary">加载失败：${err.message}</td></tr>`;
+    });
+
+    // 详情加载：单条元数据 + TLS 字段 + 时序
+    async function loadDetail(uid) {
+      try {
+        const d = await fetchMetadataDetail(uid);
+        document.getElementById('flowDetail').innerHTML = renderDetail(d);
+        renderTemporalCharts(d.temporal || {});
+      } catch (err) {
+        document.getElementById('flowDetail').innerHTML =
+          `<div class="empty-state">加载失败：${err.message}</div>`;
+      }
+    }
+
+    // 渲染详情卡：基础元数据 / TLS 元数据 / 时序行为
+    function renderDetail(d) {
+      const metadata = d.metadata || {};
+      const tls = d.tls || {};
+
+      const metaRows = Object.entries(metadata).map(([k, v]) =>
+        `<div class="kv-row"><span class="kv-key">${k}</span><span class="kv-val mono">${v ?? '-'}</span></div>`
+      ).join('');
+
+      const tlsRows = Object.entries(tls).map(([k, v]) =>
+        `<div class="kv-row"><span class="kv-key">${k}</span><span class="kv-val mono">${v ?? '-'}</span></div>`
+      ).join('') || '<div class="empty-state">无 TLS 日志</div>';
+
+      return `
+        <div class="kv-section">
+          <div class="card-title"><span class="accent"></span>基础元数据</div>
+          ${metaRows}
+        </div>
+        <div class="kv-section">
+          <div class="card-title"><span class="accent"></span>TLS 元数据（解析 zeek log）</div>
+          ${tlsRows}
+        </div>
+        <div class="kv-section">
+          <div class="card-title"><span class="accent"></span>时序行为</div>
+          <div id="sizeChart" style="height:160px"></div>
+          <div id="iatChart" style="height:160px"></div>
+          <div id="dirChart" style="height:160px"></div>
+        </div>
+      `;
+    }
+
+    // 时序行为三图：使用原生 SVG，避免页面启动时下载外部图表库。
+    function renderTemporalCharts(temporal) {
+      const lengths = temporal.packet_lengths || temporal.lengths || [];
+      const offsets = temporal.packet_time_offsets || temporal.time_offsets || temporal.offsets || [];
+      const dirs = temporal.packet_directions || temporal.directions || [];
+
+      const bins = Array(10).fill(0);
+      const max = Math.max(...lengths, 1);
+      lengths.forEach(v => {
+        const idx = Math.min(9, Math.floor(v / max * 10));
+        bins[idx]++;
+      });
+      document.getElementById('sizeChart').innerHTML = histogramSVG('包大小分布', bins, '#3B82F6');
+
+      // 2. IAT 分布（offsets 差分）
+      const iats = offsets.slice(1).map((v, i) => v - offsets[i]).filter(x => x >= 0);
+      const iatBins = Array(10).fill(0);
+      const iatMax = Math.max(...iats, 0.001);
+      iats.forEach(v => {
+        const idx = Math.min(9, Math.floor(v / iatMax * 10));
+        iatBins[idx]++;
+      });
+      document.getElementById('iatChart').innerHTML = histogramSVG('到达间隔 IAT 分布', iatBins, '#10B981');
+
+      // 3. direction 时间轴（fwd/bwd 交替，scatter）
+      document.getElementById('dirChart').innerHTML = timelineSVG(offsets, dirs);
+    }
+
+    function histogramSVG(title, values, color) {
+      const width = 720, height = 150, top = 28, bottom = 18;
+      const peak = Math.max(...values, 1);
+      const gap = 8, barWidth = (width - 40 - gap * (values.length - 1)) / values.length;
+      const bars = values.map((value, index) => {
+        const h = (height - top - bottom) * value / peak;
+        const x = 20 + index * (barWidth + gap);
+        return `<rect x="${x}" y="${height-bottom-h}" width="${barWidth}" height="${h}" fill="${color}"><title>${value}</title></rect>`;
+      }).join('');
+      return `<svg viewBox="0 0 ${width} ${height}" width="100%" height="150" role="img"><text x="${width/2}" y="16" text-anchor="middle" fill="#9bb0cc" font-size="12">${title}</text>${bars}<line x1="20" y1="${height-bottom}" x2="${width-20}" y2="${height-bottom}" stroke="#374151"/></svg>`;
+    }
+
+    function timelineSVG(offsets, dirs) {
+      const width = 720, height = 150, maxTime = Math.max(...offsets, 1);
+      const points = offsets.slice(0, 1000).map((time, index) => {
+        const x = 45 + (width - 65) * time / maxTime;
+        const forward = dirs[index] === 'F' || dirs[index] === 1 || dirs[index] === '1';
+        const y = forward ? 55 : 112;
+        return `<circle cx="${x}" cy="${y}" r="2.5" fill="${forward ? '#3B82F6' : '#D97706'}"><title>t=${Number(time).toFixed(3)}s ${forward ? 'fwd' : 'bwd'}</title></circle>`;
+      }).join('');
+      return `<svg viewBox="0 0 ${width} ${height}" width="100%" height="150" role="img"><text x="${width/2}" y="16" text-anchor="middle" fill="#9bb0cc" font-size="12">方向时序</text><text x="8" y="59" fill="#9bb0cc" font-size="11">fwd</text><text x="8" y="116" fill="#9bb0cc" font-size="11">bwd</text><line x1="45" y1="55" x2="${width-20}" y2="55" stroke="#374151"/><line x1="45" y1="112" x2="${width-20}" y2="112" stroke="#374151"/>${points}</svg>`;
+    }
+  </script>
+</body>
+</html>

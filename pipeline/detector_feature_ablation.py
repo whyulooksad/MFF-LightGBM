@@ -37,9 +37,10 @@ from pipeline.detector import (
     TEST_SIZE,
     VAL_SIZE_WITHIN_TRAIN,
     detector_feature_columns,
+    normalize_label_series,
     preprocess_detector_dataframe,
 )
-from pipeline.pca_reduce_features import reduce_feat_in_memory
+from pipeline.supcon_ae import SupConAEReducer, replace_semantic_features, semantic_feature_columns
 
 
 REPORT_DIR = PIPELINE_OUTPUT_DIR / "detector_report" / "feature_ablation"
@@ -230,14 +231,29 @@ def main(n_components: int = 64):
     print("=" * 60)
     print(f"[1/4] Read fused features: {FEATURES_FUSED_CSV}")
     raw_df = pd.read_csv(FEATURES_FUSED_CSV)
-    print(f"      PCA 降维 feat_*: 768 -> {n_components} 维 (manual 原样保留)")
-    raw_df = reduce_feat_in_memory(raw_df, n_components=n_components, seed=SEED)
+    if LABEL_COL not in raw_df.columns:
+        raise ValueError(f"Feature ablation requires a '{LABEL_COL}' column")
+    raw_df[LABEL_COL] = normalize_label_series(raw_df[LABEL_COL])
+    raw_y = raw_df[LABEL_COL].astype("int64").to_numpy()
+    train_idx, val_idx, test_idx, y_train, y_val = split_indices(raw_y)
+
+    semantic_cols = semantic_feature_columns(raw_df)
+    print(f"      SupCon-AE 降维 feat_*: {len(semantic_cols)} -> {n_components} 维 (manual 原样保留)")
+    reducer = SupConAEReducer(config={"latent_dim": n_components}, verbose=True)
+    reducer.fit(
+        raw_df.iloc[train_idx][semantic_cols],
+        y_train,
+        val_features=raw_df.iloc[val_idx][semantic_cols],
+        val_labels=y_val,
+        feature_columns=semantic_cols,
+        checkpoint_path=CHECKPOINT_DIR / "supcon_ae.pt",
+    )
+    raw_df = replace_semantic_features(raw_df, reducer)
     df = preprocess_detector_dataframe(raw_df)
     if LABEL_COL not in df.columns:
         raise ValueError(f"Feature ablation requires a '{LABEL_COL}' column")
 
     y = df[LABEL_COL].astype("int64").to_numpy()
-    train_idx, val_idx, test_idx, _, _ = split_indices(y)
     y_test = y[test_idx]
 
     metrics_rows = []
@@ -268,7 +284,7 @@ def main(n_components: int = 64):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="LightGBM feature ablation (PCA 降维版)")
-    parser.add_argument("--n-components", type=int, default=64, help="PCA 目标维度,默认 64")
+    parser = argparse.ArgumentParser(description="LightGBM feature ablation (SupCon-AE 降维版)")
+    parser.add_argument("--n-components", type=int, default=64, help="SupCon-AE 目标维度,默认 64")
     args = parser.parse_args()
     main(n_components=args.n_components)

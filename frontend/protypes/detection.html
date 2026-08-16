@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>检测与模型评估 · MFF-LightGBM</title>
+  <link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+
+  <div class="main">
+    <div class="page-header">
+      <div class="breadcrumb">检测任务 / <span>检测与模型评估</span></div>
+      <h1>检测与模型评估</h1>
+      <div class="subtitle">三个 Tab 切换查看：总览（图+摘要）/ 算法指标（详细数值）/ 逐流预测（按流查询）。</div>
+    </div>
+
+    <!-- Tab bar -->
+    <div class="tab-bar">
+      <button class="tab active" data-tab="overview">总览</button>
+      <button class="tab" data-tab="metrics">算法指标</button>
+      <button class="tab" data-tab="predictions">逐流预测</button>
+    </div>
+
+    <!-- Pane 1: 总览 -->
+    <div class="tab-pane active" id="pane-overview">
+      <section class="mb-24">
+        <h2>摘要</h2>
+        <div id="summary" class="metrics-inline"></div>
+      </section>
+
+      <section class="mb-24">
+        <h2>混淆矩阵</h2>
+        <img id="cmImg" class="eval-image" alt="混淆矩阵">
+      </section>
+
+      <section class="mb-24">
+        <h2>ROC 曲线</h2>
+        <img id="rocImg" class="eval-image" alt="ROC 曲线">
+      </section>
+
+      <section>
+        <h2>F1 对比</h2>
+        <img id="f1Img" class="eval-image" alt="F1 对比">
+      </section>
+    </div>
+
+    <!-- Pane 2: 算法指标 -->
+    <div class="tab-pane" id="pane-metrics">
+      <section>
+        <h2>算法对比与分类指标</h2>
+        <div id="algoTable"></div>
+      </section>
+    </div>
+
+    <!-- Pane 3: 逐流预测 -->
+    <div class="tab-pane" id="pane-predictions">
+      <section>
+        <h2>逐流预测表</h2>
+        <div id="predTable"></div>
+      </section>
+    </div>
+  </div>
+
+  <script src="shared/real-data.js"></script>
+  <script>
+    document.getElementById('topbar').innerHTML = renderTopbar();
+    document.getElementById('sidebar').innerHTML = renderSidebar('detection');
+    registerDarkTheme();
+
+    // ============ Tab 切换 ============
+    document.querySelectorAll('.tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const target = btn.dataset.tab;
+        document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b === btn));
+        document.querySelectorAll('.tab-pane').forEach(p =>
+          p.classList.toggle('active', p.id === `pane-${target}`));
+      });
+    });
+
+    // ============ 算法对比表渲染 ============
+    function renderAlgoTable(algos) {
+      return `
+        <table class="data-table">
+          <thead><tr><th>算法</th><th>Macro F1</th><th>Accuracy</th><th>类别明细</th></tr></thead>
+          <tbody>${algos.map(a => `
+            <tr>
+              <td>${a.name}</td>
+              <td class="mono">${(a.macro_f1 ?? 0).toFixed(4)}</td>
+              <td class="mono">${(a.accuracy ?? 0).toFixed(4)}</td>
+              <td class="mono">${(a.per_class ?? []).map(c => `${c.label_id}:${c.f1.toFixed(2)}`).join(' ')}</td>
+            </tr>
+          `).join('')}</tbody>
+        </table>
+      `;
+    }
+
+    // ============ 拉数据 ============
+    const source = new URLSearchParams(location.search).get('source') || 'static';
+
+    fetchEvaluation(source).then(ev => {
+      document.getElementById('summary').innerHTML = `
+        <div class="metric-inline"><div class="label">测试集样本</div><div class="value mono">${ev.test_set.samples.toLocaleString()}</div></div>
+        <div class="metric-inline"><div class="label">类别数</div><div class="value mono">8</div></div>
+        ${ev.algos.map(a => `
+          <div class="metric-inline"><div class="label">${a.name} Macro F1</div><div class="value mono">${(a.macro_f1 ?? 0).toFixed(4)}</div></div>
+        `).join('')}
+      `;
+      document.getElementById('algoTable').innerHTML = renderAlgoTable(ev.algos);
+    }).catch(err => {
+      document.getElementById('summary').innerHTML = `<div class="metric-inline"><div class="label">错误</div><div class="value">评估数据加载失败：${err.message}</div></div>`;
+    });
+
+    document.getElementById('cmImg').src = evalImageURL('confusion_matrix', source);
+    document.getElementById('rocImg').src = evalImageURL('roc_curves_compare', source);
+    document.getElementById('f1Img').src = evalImageURL('f1_comparison', source);
+
+    fetchPredictions({source, limit: 50}).then(({rows, total}) => {
+      document.getElementById('predTable').innerHTML = `
+        <table class="data-table">
+          <thead><tr><th>flow_id</th><th>pred_label_name</th><th>true_label_name</th></tr></thead>
+          <tbody>${rows.map(r => `
+            <tr>
+              <td class="mono">${r.flow_uid ?? r.flow_id ?? '-'}</td>
+              <td>${r.pred_label_name}</td>
+              <td>${r.true_label_name ?? '-'}</td>
+            </tr>
+          `).join('')}</tbody>
+        </table>
+        <div class="pagination">显示 ${rows.length} / 共 ${total}</div>
+      `;
+    }).catch(err => {
+      document.getElementById('predTable').innerHTML = `<div>逐流预测加载失败：${err.message}</div>`;
+    });
+  </script>
+</body>
+</html>
