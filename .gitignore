@@ -33,6 +33,17 @@ env/
 .python-version
 .cache/
 
+# Local runtime databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
 # IDE and operating-system files
 .idea/
 .vscode/
@@ -44,19 +55,22 @@ Desktop.ini
 .agents/
 .codex/
 
-# Web application runtime state
-/app/tasks.db
-/app/tasks.db-*
-/app/*.sqlite
-/app/*.sqlite3
-
 # Large datasets and generated pipeline outputs
-/data/
+/data/**/*
+!/data/**/
+!/data/**/readme.txt
+/data/runtime/tasks/*/
 /data_example/
 
-# Local model weights and training checkpoints
-/models/
-/checkpoints/
+# Local model weights and training checkpoints; keep only structure metadata.
+/models/**/*
+!/models/**/
+!/models/**/readme.txt
+!/models/README.md
+!/models/production/active.json
+!/models/production/*/manifest.json
+!/models/production/*/feature_schema.json
+!/models/production/*/label_mapping.json
 /hf_cache/
 *.pt
 *.pth
@@ -86,6 +100,7 @@ Desktop.ini
 *.log
 
 # Generated legacy experiment figures/data
+/legacy/models/
 /legacy/**/*.png
 /legacy/**/*.jpg
 /legacy/**/*.jpeg
@@ -94,13 +109,9 @@ Desktop.ini
 /legacy/**/*.tsv
 /legacy/**/*.jsonl
 
-# Private reports and working notes
-/docs/
-
-# Unused frontend reference screenshots (the actual UI source is tracked)
-/frontend/*.png
-/frontend/*.jpg
-/frontend/*.jpeg
+# Generated reports/assets stay local; Markdown project documentation is tracked.
+/docs/*
+!/docs/*.md
 
 # Binary reports and office temporary files
 *.pdf

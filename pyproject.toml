@@ -1,7 +1,7 @@
 [project]
 name = "encrypted-traffic-detection"
 version = "0.1.0"
-description = "Encrypted traffic detection pipeline with a FastAPI demonstration frontend"
+description = "Encrypted traffic detection pipeline with a task-scoped FastAPI frontend"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -32,7 +32,16 @@ dependencies = [
     "pytest-asyncio>=1.0.0",
     "uvicorn[standard]>=0.34.0",
     "xgboost",
+    "scapy>=2.6.1",
+    "cryptography>=45.0.0",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.uv]
+package = false
 
 [[tool.uv.index]]
 name = "pytorch-cu121"

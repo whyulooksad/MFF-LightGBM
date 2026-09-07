@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>检测结果 · 加密流量安全检测</title>
+  <link rel="stylesheet" href="shared/styles.css?v=4">
+</head>
+<body>
+  <div id="topbar"></div><div id="sidebar"></div>
+  <main class="main user-main">
+    <div id="resultRoot"><div class="loading-state"><span class="loader"></span>正在加载检测结果…</div></div>
+  </main>
+  <script src="shared/real-data.js?v=3"></script>
+  <script>
+    document.getElementById('topbar').innerHTML = renderTopbar();
+    document.getElementById('sidebar').innerHTML = renderSidebar('history');
+    const root = document.getElementById('resultRoot');
+    const taskId = new URLSearchParams(location.search).get('task');
+    const LABELS = Object.keys(LABEL_INFO);
+    let offset = 0, total = 0, currentLabel = '', summaryData = null;
+    const PAGE_SIZE = 30;
+
+    function pct(value, digits = 1) { return (Number(value || 0) * 100).toFixed(digits) + '%'; }
+    function endpoint(row) { return `${escapeHTML(row.src_ip || '?')}:${escapeHTML(row.src_port ?? '?')} → ${escapeHTML(row.dst_ip || '?')}:${escapeHTML(row.dst_port ?? '?')}`; }
+
+    if (!taskId) {
+      root.innerHTML = `<div class="empty-page"><div class="empty-icon">⌁</div><h1>请选择一条检测记录</h1><p>你可以查看历史检测，或者上传新的抓包文件。</p><div><a class="btn btn-primary btn-lg" href="alarms.html">查看检测记录</a><a class="btn btn-ghost btn-lg" href="upload.html">开始新检测</a></div></div>`;
+    } else {
+      init();
+    }
+
+    async function init() {
+      try {
+        summaryData = await fetchTaskSummary(taskId);
+        renderShell(summaryData);
+        await loadRows();
+      } catch (err) {
+        root.innerHTML = `<div class="empty-page"><div class="empty-icon danger">!</div><h1>结果暂时无法查看</h1><p>${escapeHTML(err.message)}</p><div><a class="btn btn-primary" href="alarms.html">返回检测记录</a></div></div>`;
+      }
+    }
+
+    function renderShell(summary) {
+      const malicious = Number(summary.malicious_flows || 0);
+      const totalFlows = Number(summary.total_flows || 0);
+      const isSafe = malicious === 0;
+      const riskTitle = isSafe ? '未发现明显异常流量' : `发现 ${malicious.toLocaleString()} 条可疑流量`;
+      const riskText = isSafe ? '本次检测未识别出已知恶意行为。建议结合业务情况持续观察。' : '建议优先核查下方可疑连接，并对相关终端进行隔离或进一步排查。';
+      const counts = summary.pred_counts || {};
+      const threatCounts = Object.entries(counts).filter(([key, value]) => key !== 'benign' && value > 0).sort((a,b) => b[1]-a[1]);
+      root.innerHTML = `
+        <div class="result-toolbar"><a class="back-link" href="alarms.html">← 检测记录</a><div><a class="btn btn-ghost" href="tls-analysis.html?task=${encodeURIComponent(taskId)}">查看 TLS 详情</a> <a class="btn btn-primary" href="upload.html">新建检测</a></div></div>
+        <section class="risk-banner ${isSafe ? 'safe' : 'alert'}">
+          <div class="risk-icon">${isSafe ? '✓' : '!'}</div>
+          <div><span class="eyebrow">${isSafe ? '检测完成 · 风险较低' : '检测完成 · 需要关注'}</span><h1>${riskTitle}</h1><p>${riskText}</p></div>
+        </section>
+        <section class="result-meta"><div><span>检测文件</span><strong>${escapeHTML(displayFilename(summary.pcap_filename))}</strong></div><div><span>网络连接</span><strong>${totalFlows.toLocaleString()} 条</strong></div><div><span>可疑占比</span><strong class="${isSafe ? 'text-success' : 'text-danger'}">${pct(summary.malicious_ratio)}</strong></div><div><span>检测用时</span><strong>${Number(summary.elapsed_sec || 0).toFixed(1)} 秒</strong></div></section>
+        <div class="result-grid">
+          <section class="section-block">
+            <div class="section-heading"><div><h2>风险概览</h2><p>按检测到的威胁类型汇总</p></div></div>
+            <div class="threat-summary" id="threatSummary">${threatCounts.length ? threatCounts.map(([key,value]) => {
+              const info = labelInfo(key);
+              return `<button class="threat-item level-${info.level}" data-label="${key}"><span class="threat-dot"></span><div><strong>${info.name}</strong><small>${info.description}</small></div><b>${value}</b></button>`;
+            }).join('') : '<div class="all-clear"><span>✓</span><div><strong>所有连接均未发现已知风险</strong><small>本结果仅代表当前模型识别范围，不能替代完整安全审计。</small></div></div>'}</div>
+          </section>
+          <aside class="advice-card ${isSafe ? 'safe' : ''}">
+            <h2>${isSafe ? '后续建议' : '建议立即处理'}</h2>
+            <ol>${isSafe ? '<li>保存本次检测记录，便于后续对比。</li><li>如仍有异常迹象，可结合终端日志进一步核查。</li>' : '<li>核对可疑连接的源地址与责任终端。</li><li>高危连接建议先隔离，再进行终端查杀。</li><li>结合防火墙和 DNS 日志确认是否持续通信。</li>'}</ol>
+          </aside>
+        </div>
+        <section class="section-block">
+          <div class="section-heading table-heading"><div><h2>连接明细</h2><p>优先展示可疑连接，可按类型筛选</p></div><div class="filter-group"><label for="labelFilter">显示</label><select class="select" id="labelFilter"><option value="">全部连接</option>${LABELS.map(key => `<option value="${key}">${labelInfo(key).name}</option>`).join('')}</select></div></div>
+          <div class="table-wrapper" id="resultTable"></div>
+          <div class="pager"><button class="btn btn-ghost" id="prevBtn">上一页</button><span id="pageInfo"></span><button class="btn btn-ghost" id="nextBtn">下一页</button></div>
+        </section>
+        <div class="result-footnote">检测编号：${escapeHTML(taskId)} · 自动检测结果仅供安全排查参考</div>`;
+      document.getElementById('labelFilter').onchange = e => { currentLabel = e.target.value; offset = 0; loadRows(); };
+      document.getElementById('prevBtn').onclick = () => { if (offset > 0) { offset = Math.max(0, offset - PAGE_SIZE); loadRows(); } };
+      document.getElementById('nextBtn').onclick = () => { if (offset + PAGE_SIZE < total) { offset += PAGE_SIZE; loadRows(); } };
+      document.querySelectorAll('.threat-item').forEach(el => el.onclick = () => {
+        currentLabel = el.dataset.label; offset = 0; document.getElementById('labelFilter').value = currentLabel; loadRows();
+        document.getElementById('resultTable').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+
+    async function loadRows() {
+      const table = document.getElementById('resultTable');
+      if (!table) return;
+      table.innerHTML = '<div class="loading-state small"><span class="loader"></span>正在加载连接明细…</div>';
+      try {
+        const data = await fetchTaskPredictions({ taskId, limit: PAGE_SIZE, offset, label: currentLabel });
+        const rows = data.rows || []; total = Number(data.total || 0);
+        table.innerHTML = rows.length ? `<table class="data-table result-table"><thead><tr><th>连接</th><th>协议</th><th>检测结果</th><th>可信度</th><th>建议</th></tr></thead><tbody>${rows.map(row => {
+          const info = labelInfo(row.pred_label_name), safe = row.pred_label_name === 'benign';
+          return `<tr><td><strong class="endpoint">${endpoint(row)}</strong><small class="flow-id">${escapeHTML(row.flow_uid || '')}</small></td><td><span class="protocol-badge">${escapeHTML(String(row.protocol || '—').toUpperCase())}</span></td><td><span class="risk-label level-${info.level}"><i></i>${info.name}</span><small class="risk-description">${info.description}</small></td><td><strong>${pct(row.confidence)}</strong><div class="confidence-track"><i style="width:${Math.max(2,Number(row.confidence || 0)*100)}%"></i></div></td><td>${safe ? '保持观察' : info.level === 'critical' || info.level === 'high' ? '优先核查' : '建议核查'}</td></tr>`;
+        }).join('')}</tbody></table>` : '<div class="empty-friendly">当前筛选条件下没有连接。</div>';
+        const start = total ? offset + 1 : 0, end = Math.min(offset + PAGE_SIZE, total);
+        document.getElementById('pageInfo').textContent = `${start}–${end} / 共 ${total} 条`;
+        document.getElementById('prevBtn').disabled = offset === 0;
+        document.getElementById('nextBtn').disabled = offset + PAGE_SIZE >= total;
+      } catch (err) { table.innerHTML = `<div class="empty-friendly text-danger">连接明细加载失败：${escapeHTML(err.message)}</div>`; }
+    }
+  </script>
+</body>
+</html>

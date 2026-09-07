@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>开始检测 · 加密流量安全检测</title>
+  <link rel="stylesheet" href="shared/styles.css?v=4">
+</head>
+<body>
+  <div id="topbar"></div><div id="sidebar"></div>
+  <main class="main user-main narrow-main">
+    <div class="page-header clean-header"><a class="back-link" href="index.html">← 返回首页</a><h1>开始一次新检测</h1><div class="subtitle">上传抓包文件，我们会自动分析其中的网络连接并生成安全结果。</div></div>
+    <div class="upload-workspace">
+      <section class="upload-card" id="uploadCard">
+        <div class="step-kicker">第 1 步，共 2 步</div>
+        <h2>选择抓包文件</h2>
+        <p class="section-description">支持 .pcap 和 .pcapng 格式。检测过程不会解密或展示通信内容。</p>
+        <div class="upload-zone friendly-zone" id="dropZone" tabindex="0" role="button" aria-label="选择抓包文件">
+          <div class="upload-symbol"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></svg></div>
+          <h3>拖拽文件到这里</h3><div class="hint">或者点击选择文件</div>
+          <input type="file" id="fileInput" accept=".pcap,.pcapng" hidden>
+        </div>
+        <div class="selected-file" id="fileInfo" hidden>
+          <div class="file-icon">PCAP</div>
+          <div class="selected-file-name"><strong id="fileName"></strong><span id="fileSize"></span></div>
+          <button class="remove-file" id="removeFile" type="button">移除</button>
+        </div>
+        <div class="form-message" id="formMessage" role="alert"></div>
+        <button class="btn btn-primary btn-lg w-full" id="startBtn" disabled>开始检测</button>
+      </section>
+
+      <section class="progress-card" id="progressCard" hidden>
+        <div class="progress-head"><div><div class="step-kicker">正在检测</div><h2 id="progressTitle">正在准备文件…</h2></div><span class="elapsed-pill" id="elapsed">00:00</span></div>
+        <p class="section-description" id="progressHint">文件较大时可能需要几分钟，请保持此页面开启。</p>
+        <div class="overall-progress"><div id="overallBar"></div></div>
+        <div class="user-steps">
+          <div class="user-step active"><span>1</span><div><strong>读取抓包文件</strong><small>整理网络连接</small></div></div>
+          <div class="user-step"><span>2</span><div><strong>分析连接行为</strong><small>检查流量和加密通信特征</small></div></div>
+          <div class="user-step"><span>3</span><div><strong>识别安全风险</strong><small>判断是否存在异常流量</small></div></div>
+          <div class="user-step"><span>4</span><div><strong>生成检测结果</strong><small>汇总可疑连接和处置建议</small></div></div>
+        </div>
+        <div class="progress-note">检测仅在本机服务中处理，请勿关闭当前页面。</div>
+      </section>
+    </div>
+  </main>
+  <script src="shared/real-data.js?v=3"></script>
+  <script>
+    document.getElementById('topbar').innerHTML = renderTopbar();
+    document.getElementById('sidebar').innerHTML = renderSidebar('upload');
+    const input = document.getElementById('fileInput'), zone = document.getElementById('dropZone');
+    const info = document.getElementById('fileInfo'), message = document.getElementById('formMessage');
+    const start = document.getElementById('startBtn');
+    let selectedFile = null, timer = null, startedAt = 0;
+
+    function setFile(file) {
+      message.textContent = '';
+      if (!file) { selectedFile = null; input.value = ''; info.hidden = true; zone.hidden = false; start.disabled = true; return; }
+      if (!/\.(pcap|pcapng)$/i.test(file.name)) { message.textContent = '请选择 .pcap 或 .pcapng 格式的抓包文件。'; return; }
+      selectedFile = file; zone.hidden = true; info.hidden = false; start.disabled = false;
+      document.getElementById('fileName').textContent = file.name;
+      document.getElementById('fileSize').textContent = file.size < 1024 * 1024 ? (file.size / 1024).toFixed(1) + ' KB' : (file.size / 1024 / 1024).toFixed(1) + ' MB';
+    }
+    zone.onclick = () => input.click();
+    zone.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') input.click(); };
+    input.onchange = () => setFile(input.files[0]);
+    document.getElementById('removeFile').onclick = () => setFile(null);
+    ['dragenter','dragover'].forEach(n => zone.addEventListener(n, e => { e.preventDefault(); zone.classList.add('dragging'); }));
+    ['dragleave','drop'].forEach(n => zone.addEventListener(n, e => { e.preventDefault(); zone.classList.remove('dragging'); }));
+    zone.addEventListener('drop', e => setFile(e.dataTransfer.files[0]));
+
+    function showProgress() {
+      document.getElementById('uploadCard').hidden = true; document.getElementById('progressCard').hidden = false;
+      startedAt = Date.now(); timer = setInterval(() => {
+        const s = Math.floor((Date.now() - startedAt) / 1000);
+        document.getElementById('elapsed').textContent = String(Math.floor(s / 60)).padStart(2,'0') + ':' + String(s % 60).padStart(2,'0');
+      }, 1000);
+    }
+    function updateProgress(evt, data) {
+      if (!data.stage) return;
+      const mapped = data.stage === 1 ? 1 : data.stage <= 3 ? 2 : data.stage === 4 ? 3 : 4;
+      const titles = ['正在读取抓包文件…','正在分析连接行为…','正在识别安全风险…','正在生成检测结果…'];
+      document.getElementById('progressTitle').textContent = titles[mapped - 1];
+      const steps = document.querySelectorAll('.user-step');
+      steps.forEach((el, i) => { el.className = 'user-step ' + (i + 1 < mapped ? 'done' : i + 1 === mapped ? 'active' : ''); });
+      const local = data.progress == null ? 0.2 : data.progress;
+      document.getElementById('overallBar').style.width = Math.min(98, ((mapped - 1 + local) / 4) * 100) + '%';
+    }
+    start.onclick = async () => {
+      if (!selectedFile) return;
+      start.disabled = true; showProgress();
+      const fd = new FormData(); fd.append('file', selectedFile);
+      try {
+        const response = await fetch(`${API_BASE}/api/analyze`, { method: 'POST', body: fd });
+        const data = await response.json();
+        if (!response.ok || !data.task_id) throw new Error(data.detail || '检测任务启动失败');
+        streamTaskProgress(data.task_id, {
+          onEvent: updateProgress,
+          onDone: (name, result) => {
+            clearInterval(timer);
+            if (name === 'task_done') { document.getElementById('overallBar').style.width = '100%'; location.href = result.redirect || `detection.html?task=${encodeURIComponent(data.task_id)}`; }
+            else { showError(result.error || '检测失败，请重试。'); }
+          },
+          onError: () => showError('与检测服务的连接已中断，请返回后重试。')
+        });
+      } catch (err) { showError(err.message); }
+    };
+    function showError(text) {
+      clearInterval(timer); document.getElementById('progressTitle').textContent = '检测未完成';
+      document.getElementById('progressHint').textContent = text;
+      document.getElementById('progressHint').className = 'section-description text-danger';
+      const note = document.querySelector('.progress-note'); note.innerHTML = '<a class="btn btn-primary" href="upload.html">重新检测</a>';
+    }
+  </script>
+</body>
+</html>

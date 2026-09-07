@@ -1,1277 +1,685 @@
-# MFF-LightGBM：基于多维特征融合的异常加密流量检测模型
+# MFF-LightGBM：异常加密流量八分类系统
 
-> 基于 DeBERTa-v3 与 LightGBM 的恶意加密流量检测算法——在不解密通信内容的前提下，融合流量统计特征与 TLS/X509 行为语义特征，实现正常流量、广告软件、DNS 隧道、勒索软件等八类加密流量检测。
+这是一个在**不解密应用正文**的前提下，对 PCAP/PCAPNG 中的网络连接进行八分类检测的项目。
 
-如今 HTTPS、TLS 等加密协议已经成为网络通信的默认选择。加密保护了用户隐私，也让传统依赖载荷关键字、明文协议字段和内容规则的检测方法受到限制。更棘手的是，恶意软件同样可以使用 TLS 隐藏命令控制通信，DNS 隧道可以把数据编码到域名中，勒索软件也可能通过加密连接与外部服务器交互。
+系统把每条双向流表示为两类信息：
 
-这并不意味着加密流量完全不可分析。即使不解密应用层内容，仍然能够观察流量的包长、方向、时间间隔、连接状态、TLS 握手参数、服务器名称以及 X509 证书等侧面信息。这些信息不会直接泄露通信正文，却能反映一条连接的行为模式。
+- 80 维流量统计、TCP、TLS 和 X.509 数值特征；
+- 由连接、TLS、证书结构化事件序列产生的 DeBERTa-v3 语义特征。
 
-本文完整讲解我实现的 **MFF-LightGBM 异常加密流量检测系统**。系统从原始 PCAP/PCAPNG 文件开始，依次完成数据处理、统计特征提取、语义特征提取、特征降维融合和 LightGBM 检测。
+语义特征经过 SupCon-AE 压缩后与 80 维数值特征融合，最终由 LightGBM 输出八分类结果。
 
-![image-20260808035210747](https://fastly.jsdelivr.net/gh/whyulooksad/image_bed@main/images/20260808035211197.png)
+> 当前状态：源码重构和严格解析器已经完成，旧代码与旧模型已经归档；公开数据集仍在下载，因此兼容新特征契约的生产模型尚未重新训练。用户页面可以启动，但上传检测会在模型发布前明确提示“检测模型尚未就绪”。
 
-# 一、任务定义与总体架构
+---
 
-### 1.1 八分类检测任务
+## 1. 第一次回来时，按什么顺序阅读
 
-系统当前识别八类加密流量：
+如果已经忘记了项目，不建议从训练代码一头扎进去。按下面顺序读最快：
 
-| 标签 ID | 类别       | 含义             |
-| ------: | ---------- | ---------------- |
-|       0 | benign     | 正常流量         |
-|       1 | adware     | 广告软件流量     |
-|       2 | dns2tcp    | dns2tcp DNS 隧道 |
-|       3 | dnscat2    | dnscat2 DNS 隧道 |
-|       4 | iodine     | iodine DNS 隧道  |
-|       5 | ransomware | 勒索软件流量     |
-|       6 | scareware  | 恐吓软件流量     |
-|       7 | smsmalware | 短信恶意软件流量 |
+1. 先读本 README 的“项目全貌”和“完整目录树”，建立整体地图。
+2. 读 [`docs/系统复习文档.md`](docs/系统复习文档.md)，补回流、TLS、X.509、CLS、LoRA、SupCon-AE 等概念。
+3. 读 [`user_app/inference/contract.py`](user_app/inference/contract.py)，明确八个标签和 80 个特征的唯一契约。
+4. 依次读抓包解析主链：`pcap_reader.py → tcp_reassembly.py → tls_parser.py → x509_parser.py → extract_flow_features.py`。
+5. 再读模型主链：`serialize_flow.py → semantic_encoder.py → supcon_reducer.py → lightgbm_detector.py`。
+6. 读 [`developer/pipeline.py`](developer/pipeline.py)，理解开发者如何串起数据、训练与评估。
+7. 读 [`user_app/inference/pipeline.py`](user_app/inference/pipeline.py)，理解用户上传后如何只做推理。
+8. 最后读后端和前端；它们只负责提交用户任务并展示结果。
 
-### 1.2 项目整体思路
+如果只想启动或继续训练，直接看本文第 8～13 节即可。
 
-这个项目要解决的核心问题可以概括为：**当 TLS 已经把通信正文加密后，如何只利用仍然可观察的信息判断一条流量是否恶意，以及它属于哪一种恶意行为？**
+---
 
-我认为的基本判断是：加密隐藏了“传输了什么内容”，但没有完全隐藏“这次通信是怎样发生的”。即使看不到明文，仍然可以观察到两类信息：
+## 2. 项目全貌：只有两条正式通道
 
-1. **流量统计与时序行为**：一条连接包含多少个包、上下行各有多少字节、包长如何分布、包与包之间间隔多久、是否频繁重连、TCP 握手是否异常等；
-2. **TLS/X509 握手语义**：使用什么 TLS 版本和密码套件、访问什么服务器名称、证书由谁签发、证书有效期多长、域名结构是否异常等。
-
-两类特征分别描述流量的不同方面，各自能发现一些另一类特征不容易发现的信息；把它们组合起来，通常比单独使用其中一类更完整。
-
-因此，我们没有选择“只使用一个深度模型端到端分类”，而是把问题拆成两条特征分支：
+### 2.1 开发者通道
 
 ```text
-分支A：数据包和双向流
-       → 包数、字节数、IAT、TCP状态、域名结构等统计特征
-
-分支B：连接日志、TLS握手和X509证书
-       → 结构化文本
-       → DeBERTa-v3
-       → 深度语义特征
+公开数据集下载与解压
+→ 来源清单、SHA-256 和标签核实
+→ 按 PCAP / APK / sample / capture 分组
+→ 固定 train / validation / test
+→ 统一特征提取
+→ RTD 领域继续预训练
+→ LoRA 八分类训练
+→ 提取 768 维 CLS
+→ SupCon-AE 压缩为 64 维
+→ 与 80 维数值特征融合
+→ LightGBM 训练
+→ 独立测试、消融实验与资源测试
+→ 校验并发布冻结模型
 ```
 
-在分支B中，DeBERTa-v3 不是直接读取加密载荷，是把一条流的连接、TLS 和证书字段这些信息编码成768维的向量。为了让通用语言模型理解这些不同于普通自然语言的字段，需要先使用 RTD 进行领域继续预训练，再通过 LoRA 让模型适应八分类任务。
+对应目录是 `developer/`、`data/developer/` 和 `models/experiments/`。
 
-但是，直接把768维语义向量与约80维统计特征拼接，会出现两个问题：一是总维度较高、存在冗余；二是语义特征数量远多于统计特征，可能使融合结果被语义分支主导。于是在融合前加入 SupCon-AE：
-
-- AutoEncoder 通过重构任务尽量保留原始语义信息；
-- 监督对比学习利用标签让同类流量在低维空间中更接近、不同类别更分离；
-- 最终把768维语义向量压缩为64维。
-
-降维后的64维语义特征与约80维统计特征拼接，形成约144维最终特征，再交给 LightGBM 完成八分类。选择 LightGBM，是因为融合后的数据已经是典型的表格型数据：既包含连续统计量，也包含神经网络生成的稠密向量。LightGBM 能表达非线性特征组合，训练和推理成本也低于继续堆叠大型神经网络。
-
-整个方案的思路不是说多个算法的叠加，而是让每个模型负责它更擅长的部分：DeBERTa 学习字段之间难以手工定义的语义关系，统计特征保留明确、可解释的流量行为，SupCon-AE负责建立更紧凑且具有类别区分度的表示，LightGBM完成最终的表格特征决策。
-
-### 1.3 完整数据链路
-
-项目的整体数据流如下：
+### 2.2 用户通道
 
 ```text
-原始 PCAP / PCAPNG
-        │
-        ▼
-按双向流保留前 N 个包
-        │
-        ▼
-流统计特征 + Zeek 风格 TLS/X509 日志
-        │
-        ├──────────────► 80 维统计数值特征 ──────────────┐
-        │                                              │
-        ▼                                              │
-TLS/X509 结构化日志序列化                                 │
-        │                                              │
-        ▼                                              │
-DeBERTa-v3 RTD 领域继续预训练                            │
-        │                                              │
-        ▼                                              │
-LoRA 八分类监督适配                                      │
-        │                                              │
-        ▼                                              │
-提取每条流的 768 维 [CLS] 语义向量                         │
-        │                                              │
-        ▼                                              │
-SupCon-AE：768 维 → 64 维                               │ 
-        │                                              │
-        └──────────────► 与人工特征拼接 ◄────────────────┘
-                                │
-                                ▼
-                       LightGBM 八分类检测
-                                │
-                                ▼
-                  指标、混淆矩阵、ROC、逐流预测
+上传 PCAP/PCAPNG
+→ 等待检测
+→ 查看风险概览、逐流结果和 TLS 详情
 ```
 
-DeBERTa 并没有读取被 TLS 加密后的应用正文，而是读取 TLS、X509 和连接行为字段序列化形成的文本，整个过程属于“不解密载荷”的检测。
+用户通道不训练、不调参、不读取开发者评估结果，也不会把用户上传自动加入训练集。对应目录是 `user_app/` 和 `data/runtime/`。
 
-# 二、数据预处理
-
-原始抓包文件中可能包含大量长连接。如果把每条连接的全部数据都交给后续流程，不仅处理速度慢，而且不同流之间长度差异非常大。所以我们先按双向流聚合数据包，然后为每条流保留前 N 个包，主要有三个目的：
-
-1. 限制单条流的计算量和内存占用；
-2. 让不同流具有更接近的观测窗口；
-3. 尽可能利用连接早期特征完成检测。
-
-这种做法也有代价：只在长连接后期出现的行为可能被截掉。因此，这种做法是效率与完整性之间的工程折中，不适用于所有数据集。
-
-### 2.1 包与双向流
-
-一个网络包具有源地址、目的地址、源端口、目的端口和协议。最直接的五元组可以表示为：
-
-```python
-forward = (src_ip, src_port, dst_ip, dst_port, protocol)
-reverse = (dst_ip, dst_port, src_ip, src_port, protocol)
-```
-
-如果只按 `forward` 建立键，那么请求和响应会被拆成两条单向流。 所以我们对正向键和反向键进行归一化，使类似下面两个方向归入同一条连接：
+### 2.3 依赖方向
 
 ```text
-192.168.1.10:51000 → 8.8.8.8:443
-8.8.8.8:443 → 192.168.1.10:51000
+developer ──────→ user_app.inference（复用唯一的解析与特征实现）
+user_app  ──X──→ developer（禁止反向依赖）
+正式源码 ──X──→ legacy（禁止使用旧代码）
 ```
 
-处理逻辑可以概括为：
+离线训练和在线检测共同调用 `extract_pcap()`，不会出现“训练时一套特征、用户上传时另一套特征”。这些边界由 `tests/test_architecture.py` 自动检查。
 
-```
-def reverse_tuple(flow_key):
-    src_ip, src_port, dst_ip, dst_port, protocol = flow_key
+---
 
-    return (
-        dst_ip,
-        dst_port,
-        src_ip,
-        src_port,
-        protocol,
-    )
-```
+## 3. 八分类任务
 
-```python
-key = extract_four_tuple(raw_packet)
-reverse_key = reverse_tuple(key)
+| ID | 标签 | 中文含义 | 典型行为 |
+|---:|---|---|---|
+| 0 | `benign` | 正常流量 | 正常浏览、应用通信、合法 DNS/HTTPS 等 |
+| 1 | `adware` | 广告软件流量 | 高频广告、追踪、推广服务器通信 |
+| 2 | `dns2tcp` | dns2tcp 隧道 | 把其他协议的数据封装进 DNS 查询与响应 |
+| 3 | `dnscat2` | dnscat2 隧道 | 通过 DNS 建立隐蔽命令控制或数据通道 |
+| 4 | `iodine` | iodine 隧道 | 使用 DNS 承载 IP 数据形成隐蔽隧道 |
+| 5 | `ransomware` | 勒索软件流量 | 与勒索软件基础设施或控制端相关的通信 |
+| 6 | `scareware` | 恐吓软件流量 | 虚假告警、诱导付费或伪安全软件通信 |
+| 7 | `smsmalware` | 短信恶意软件流量 | 与恶意短信发送、窃取或控制行为相关的通信 |
 
-if key in flow_counts:
-    canonical_key = key
-elif reverse_key in flow_counts:
-    canonical_key = reverse_key
-else:
-    canonical_key = key
-    flow_counts[canonical_key] = 0
+标签顺序不能随意调整，因为它会同时写入 LoRA 分类头、LightGBM 标签和生产模型契约。
 
-if flow_counts[canonical_key] < max_pkts:
-    writer.writepkt(raw_packet, pkt_ts)
-    flow_counts[canonical_key] += 1
-```
+---
 
-### 2.2 PCAP 与 PCAPNG
+## 4. 完整逻辑目录树
 
-`fast_pcap_iter()` 直接处理 PCAP 和 PCAPNG 文件。解析时需要关注：
-
-- 文件魔数决定格式和字节序；
-- PCAP 包头记录秒、微秒或纳秒时间戳；
-- PCAPNG 由 Section、Interface、Enhanced Packet 等 Block 组成；
-- 链路层类型决定原始数据从哪里开始解析 Ethernet/IP；
-- 截断包长度和原始包长度含义不同，读取时必须检查边界。
-
-解析器最终统一产出：
-
-```python
-(packet_timestamp, raw_packet, linktype)
-```
-
-这样，后续代码不用再区分输入来自 PCAP 还是 PCAPNG。
-
-下面是省略异常处理和部分兼容逻辑后的核心实现：
-
-```
-import struct
-
-
-def fast_pcap_iter(file_path):
-    """逐包读取 PCAP/PCAPNG。
-
-    每次返回：
-        packet_timestamp：数据包时间戳
-        raw_packet：原始报文字节
-        linktype：链路层类型
-    """
-
-    with open(file_path, "rb") as file:
-        file_header = file.read(24)
-
-        if len(file_header) < 24:
-            return
-
-        magic = file_header[:4]
-
-        # ==================================================
-        # 1. 标准 PCAP
-        # ==================================================
-        if magic in (
-            b"\xa1\xb2\xc3\xd4",  # 大端 PCAP
-            b"\xd4\xc3\xb2\xa1",  # 小端 PCAP
-        ):
-            endian = (
-                ">"
-                if magic == b"\xa1\xb2\xc3\xd4"
-                else "<"
-            )
-
-            # PCAP 全局头的第20~24字节保存链路层类型
-            linktype = struct.unpack(
-                endian + "I",
-                file_header[20:24],
-            )[0] & 0xFFFF
-
-            while True:
-                # 每个 PCAP 数据包具有16字节记录头
-                packet_header = file.read(16)
-
-                if len(packet_header) < 16:
-                    break
-
-                timestamp_seconds, timestamp_microseconds, captured_length, original_length = (
-                    struct.unpack(
-                        endian + "IIII",
-                        packet_header,
-                    )
-                )
-
-                # 检查抓包文件中实际保存的数据长度
-                if (
-                    captured_length <= 0
-                    or captured_length > 262144
-                ):
-                    break
-
-                raw_packet = file.read(captured_length)
-
-                # 文件提前结束，说明报文数据不完整
-                if len(raw_packet) < captured_length:
-                    break
-
-                packet_timestamp = (
-                    timestamp_seconds
-                    + timestamp_microseconds / 1_000_000
-                )
-
-                yield (
-                    packet_timestamp,
-                    raw_packet,
-                    linktype,
-                )
-
-        # ==================================================
-        # 2. PCAPNG
-        # ==================================================
-        elif magic == b"\x0a\x0d\x0d\x0a":
-            # PCAPNG 需要从第一个 Block 重新读取
-            file.seek(0)
-
-            # 当前项目数据默认采用 Ethernet
-            linktype = 1
-
-            while True:
-                # 每个 PCAPNG Block 前8字节：
-                # Block Type + Block Total Length
-                block_header = file.read(8)
-
-                if len(block_header) < 8:
-                    break
-
-                block_type, block_length = struct.unpack(
-                    "<II",
-                    block_header,
-                )
-
-                # 一个 Block 至少包含：
-                # 8字节头 + 4字节尾部长度
-                if (
-                    block_length < 12
-                    or block_length > 262144
-                ):
-                    break
-
-                body_length = block_length - 12
-                block_body = file.read(body_length)
-                trailing_length_data = file.read(4)
-
-                if (
-                    len(block_body) < body_length
-                    or len(trailing_length_data) < 4
-                ):
-                    break
-
-                trailing_length = struct.unpack(
-                    "<I",
-                    trailing_length_data,
-                )[0]
-
-                # PCAPNG 的 Block 首尾都会记录长度
-                if trailing_length != block_length:
-                    break
-
-                # ------------------------------------------
-                # Interface Description Block
-                # 保存该接口使用的链路层类型
-                # ------------------------------------------
-                if (
-                    block_type == 0x00000001
-                    and len(block_body) >= 8
-                ):
-                    linktype = struct.unpack(
-                        "<H",
-                        block_body[:2],
-                    )[0]
-
-                # ------------------------------------------
-                # Enhanced Packet Block
-                # 保存时间戳、抓取长度和原始报文
-                # ------------------------------------------
-                elif (
-                    block_type == 0x00000006
-                    and len(block_body) >= 20
-                ):
-                    timestamp_high = struct.unpack(
-                        "<I",
-                        block_body[4:8],
-                    )[0]
-
-                    timestamp_low = struct.unpack(
-                        "<I",
-                        block_body[8:12],
-                    )[0]
-
-                    captured_length = struct.unpack(
-                        "<I",
-                        block_body[12:16],
-                    )[0]
-
-                    original_length = struct.unpack(
-                        "<I",
-                        block_body[16:20],
-                    )[0]
-
-                    if (
-                        captured_length <= 0
-                        or captured_length > body_length - 20
-                    ):
-                        continue
-
-                    timestamp_value = (
-                        timestamp_high << 32
-                    ) + timestamp_low
-
-                    # 当前项目数据按照微秒换算
-                    packet_timestamp = (
-                        timestamp_value / 1_000_000
-                    )
-
-                    raw_packet = block_body[
-                        20:20 + captured_length
-                    ]
-
-                    yield (
-                        packet_timestamp,
-                        raw_packet,
-                        linktype,
-                    )
-
-        else:
-            raise ValueError(
-                f"无法识别抓包文件格式：{magic!r}"
-            )
-```
-
-# 三、流量统计特征提取
-
-### 3.1 特征分组
-
-在对 PCAP/PCAPNG包进行处理后，我们需要将包级数据聚合为流级特征。最终用于融合的统计数值特征约 80 维，可以分为以下几类。
-
-| 特征类别         | 包含的数值信息                                               | 对应源码字段                                                 | 直观含义                                                     |
-| ---------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| 规模与方向特征   | 正向/反向/总包数，正向/反向/总字节数，上下行比例，字节速率与包速率，TCP头长度，平均Segment大小 | `pkts_forward`、`pkts_backward`、`pkts_total`、`bytes_forward`、`bytes_backward`、`bytes_total`、`ratio_bytes_back_to_forward`、`flow_bytes_s`、`flow_pkts_s`、`fwd_pkts_s`、`bwd_pkts_s`、`fwd_header_len`、`bwd_header_len`、`down_up_ratio`、`avg_fwd_segment_size`、`avg_bwd_segment_size` | 描述一条流有多大、传输有多快，以及数据主要流向哪一边         |
-| 包长统计特征     | 全部包、正向包和反向包的长度均值、最大值、最小值、标准差和方差 | `pkt_len_max`、`pkt_len_min`、`pkt_len_mean`、`pkt_len_std`、`pkt_len_var`、`pkt_len_fwd_mean`、`pkt_len_fwd_std`、`pkt_len_bwd_mean`、`pkt_len_bwd_std` | 描述数据包通常有多大、长度是否固定，以及请求与响应的包长是否对称 |
-| 时间行为特征     | 全部、正向和反向IAT统计，Active/Idle统计                     | `iat_max`、`iat_min`、`iat_mean`、`iat_std`、`iat_fwd_max`、`iat_fwd_min`、`iat_fwd_mean`、`iat_fwd_std`、`iat_bwd_max`、`iat_bwd_min`、`iat_bwd_mean`、`iat_bwd_std`、`active_max`、`active_min`、`active_mean`、`active_std`、`idle_max`、`idle_min`、`idle_mean`、`idle_std` | 描述数据包发送节奏，以及流量是连续传输、间歇传输还是周期性唤醒 |
-| TCP 状态特征     | SYN、FIN、RST、PSH、ACK计数，握手失败率、重连次数与重连标记、RST 数量与比例 | `flag_syn_count`、`flag_fin_count`、`flag_rst_count`、`flag_psh_count`、`flag_ack_count`、`subflow_fwd_pkts`、`subflow_fwd_bytes`、`subflow_bwd_pkts`、`subflow_bwd_bytes`、`rst_ratio`、`handshake_fail_rate`、`reconnect_count`、`conn_count`、`flow_interval_jitter`、`flow_interval_diff_mean`、`tcp_rst_count`、`reconnection_flag`、`unique_dst_count`、`src_ip_abnormal_ratio`、`duration_p25`、`duration_p50`、`duration_p75`、`weighted_conn_count`、`weighted_avg_duration`、`abnormal_to_conn_ratio`、`handshake_duration` | 描述TCP建连、数据推送、断开和重置过程，以及子流规模          |
-| CN与X509数值特征 | CN字符组成、CN哈希、证书有效期、采集时证书年龄、剩余有效期和证书链深度 | `cn_vowel_ratio`、`cn_digit_density`、`cn_special_char_density`、`cn_length`、`cn_hash`、`cert_valid_days`、`cert_age_at_capture`、`cert_remaining_days`、`cert_chain_depth` | 描述域名或证书CN的字符结构，以及证书生命周期和信任链结构     |
-
-表中描述的是特征可能反映的行为，不是固定检测规则。例如，频繁重连、较高的CN数字比例或较短的证书有效期都可能出现在合法业务中，模型需要结合多项特征共同判断。
-
-为了避免混淆，两条特征路径可以明确区分为：
-
-| 特征路径         | 典型内容                                                     | 进入模型的方式                                            |
-| ---------------- | ------------------------------------------------------------ | --------------------------------------------------------- |
-| 统计数值特征     | 包数、字节数、IAT、TCP标志、重连行为、CN字符比例、证书有效期 | 作为数值列保留，后续与64维SupCon-AE输出拼接后输入LightGBM |
-| TLS/X509语义字段 | TLS版本、密码套件、曲线、SNI、证书Subject、Issuer、SAN等     | 序列化成结构化文本，输入DeBERTa得到768维语义向量          |
-
-篇幅限制很难完整讲解这80维的数值特征。下面3.2会挑一种重要的统计计算方法讲解，3.3会挑时间行为特征和CN字符特征讲解。
-
-### 3.2 Welford 在线均值与方差
-
-如果一条流包含很多数据包，最简单的统计方式是先保存所有包长，再调用 NumPy 计算均值和方差。但当同时维护大量活跃流时，这会消耗很多内存。
-
-所以我们使用 Welford 在线算法逐个更新统计量：
-
-```python
-def update_welford(stats, value):
-    stats["count"] += 1
-    delta = value - stats["mean"]
-    stats["mean"] += delta / stats["count"]
-    delta2 = value - stats["mean"]
-    stats["m2"] += delta * delta2
-```
-
-其均值更新公式为：
-
-$$
-\mu_n=\mu_{n-1}+\frac{x_n-\mu_{n-1}}{n}
-$$
-二阶矩更新为：
-
-$$
-M_{2,n}=M_{2,n-1}+(x_n-\mu_{n-1})(x_n-\mu_n)
-$$
-最后通过 `M2 / count` 或 `M2 / (count - 1)` 得到总体方差或样本方差。它只保存计数、均值和二阶矩，不需要保留完整历史数组。
-
-### 3.3 时间行为特征和CN字符结构特征
-
-时间行为特征：
-
-IAT、Active（活跃时间） 和 Idle（空闲时间） 描述的是“数据在时间上如何出现”。正常网页访问通常具有明显的突发性：页面加载时短时间内集中传输大量数据，完成后连接逐渐安静；周期性 C2 心跳可能每隔固定时间发送少量报文；DNS 隧道则可能连续发起间隔较短、节奏相似的查询。因此，时间特征能够补充包长和字节数无法表达的通信节奏。
-
-IAT 是 Inter-Arrival Time，即相邻两个数据包到达时间之差。设一条流按时间排序后的数据包时间戳为：
-
-$$
-t_1,t_2,\ldots,t_n
-$$
-那么第 \(i\) 个到达间隔为：
-
-$$
-IAT_i=t_i-t_{i-1},\quad i=2,3,\ldots,n
-$$
-当前是维护了三组 IAT：
-
-| IAT类型 | 计算范围                   | 输出字段                                                    |
-| ------- | -------------------------- | ----------------------------------------------------------- |
-| 整体IAT | 双向流中所有相邻数据包     | `iat_max`、`iat_min`、`iat_mean`、`iat_std`                 |
-| 正向IAT | 只观察正向数据包之间的间隔 | `iat_fwd_max`、`iat_fwd_min`、`iat_fwd_mean`、`iat_fwd_std` |
-| 反向IAT | 只观察反向数据包之间的间隔 | `iat_bwd_max`、`iat_bwd_min`、`iat_bwd_mean`、`iat_bwd_std` |
-
-做法上，我们在逐包解析时，保存整条流以及两个方向最近一次出现的时间戳。每读到一个新包，就用当前时间减去相应的上一个时间：
-
-```python
-# 整条双向流的IAT
-iat_total = pkt_ts - flow["last_ts_total"]
-update_welford(flow["iat_total"], iat_total)
-flow["last_ts_total"] = pkt_ts
-
-if is_forward:
-    # 当前包属于正向；只有存在上一个正向包时才能计算正向IAT
-    if flow["last_ts_fwd"] is not None:
-        iat_fwd = pkt_ts - flow["last_ts_fwd"]
-        update_welford(flow["iat_fwd"], iat_fwd)
-    flow["last_ts_fwd"] = pkt_ts
-else:
-    # 当前包属于反向；只有存在上一个反向包时才能计算反向IAT
-    if flow["last_ts_bwd"] is not None:
-        iat_bwd = pkt_ts - flow["last_ts_bwd"]
-        update_welford(flow["iat_bwd"], iat_bwd)
-    flow["last_ts_bwd"] = pkt_ts
-```
-
-这里继续使用上一节介绍的 Welford 在线统计，因此不需要保存全部 IAT 数组。流处理结束后，再读取每组统计量：
-
-```python
-iat_max, iat_min, iat_mean, iat_std = get_welford_metrics(
-    conn_entry["iat_total"]
-)
-
-iat_fwd_max, iat_fwd_min, iat_fwd_mean, iat_fwd_std = (
-    get_welford_metrics(conn_entry["iat_fwd"])
-)
-
-iat_bwd_max, iat_bwd_min, iat_bwd_mean, iat_bwd_std = (
-    get_welford_metrics(conn_entry["iat_bwd"])
-)
-```
-
-举个例子，一条流的包到达时间为：
+下面列出项目中需要维护和理解的文件。`.venv/`、`__pycache__/`、模型权重、下载中的大型压缩包以及自动生成的 CSV/图片不会逐个展开，但其存放位置和用途均已列出。
 
 ```text
-0.0秒、0.2秒、0.8秒、7.0秒、7.4秒
+E:\Work\ccb
+├─ README.md                              项目接管、复习和运行总入口
+├─ pyproject.toml                         Python 版本、依赖、pytest 与 uv 配置
+├─ uv.lock                                uv 锁定的精确依赖版本
+├─ .python-version                        本机默认 Python 版本提示
+├─ .gitignore                             忽略数据、权重、缓存和生成产物
+│
+├─ developer/                             面向开发者：数据、制模、评估、发布
+│  ├─ __init__.py                         Python 包声明
+│  ├─ README.md                           开发者通道简要说明
+│  ├─ config.py                           开发数据、实验模型和报告的路径定义
+│  ├─ pipeline.py                         开发者离线流水线统一入口
+│  ├─ data_prepare/
+│  │  ├─ __init__.py                     子包声明
+│  │  ├─ build_manifest.py               扫描 source，记录来源、类型与 SHA-256
+│  │  ├─ map_labels.py                   把外部标签规范到项目八分类
+│  │  ├─ split_dataset.py                按来源组划分并建立 prepared 硬链接
+│  │  ├─ group_split.py                  校验 group_id 不跨三个集合
+│  │  └─ batch_extract.py                批量调用唯一 extract_pcap()
+│  ├─ representation/
+│  │  ├─ __init__.py                     子包声明
+│  │  ├─ config.py                       DeBERTa、RTD、LoRA 路径和超参数
+│  │  ├─ split_input_csv.py              生成预训练与监督训练输入表
+│  │  ├─ dataset.py                      加载固定划分并构造 DataLoader
+│  │  ├─ pretrain.py                     DeBERTa-v3 RTD 领域继续预训练
+│  │  └─ train_lora.py                   LoRA 八分类训练和最佳适配器保存
+│  ├─ detector/
+│  │  ├─ __init__.py                     子包声明
+│  │  ├─ train_supcon.py                 训练 SupCon-AE，保存 reducer.pt
+│  │  ├─ train_lightgbm.py               训练 LightGBM 并生成测试报告
+│  │  └─ pca_baseline.py                 PCA 对照实验，不进入正式推理链
+│  ├─ evaluation/
+│  │  ├─ __init__.py                     子包声明
+│  │  ├─ evaluate.py                     从逐流预测计算分类指标
+│  │  ├─ feature_ablation.py             三组特征消融实验
+│  │  ├─ resource_benchmark.py            耗时、吞吐、内存和显存测试
+│  │  └─ compare_versions.py              比较多个候选发布的 metrics.json
+│  └─ release/
+│     ├─ __init__.py                     子包声明
+│     ├─ build_contract.py               生成特征、标签和发布清单
+│     ├─ validate_bundle.py              校验文件、字段和标签契约
+│     └─ publish.py                      不可覆盖地发布并可激活模型
+│
+├─ user_app/                              面向用户：上传、推理、展示
+│  ├─ __init__.py                         Python 包声明
+│  ├─ README.md                           用户通道简要说明
+│  ├─ inference/
+│  │  ├─ __init__.py                     子包声明
+│  │  ├─ config.py                       用户运行时与生产模型路径
+│  │  ├─ contract.py                     八个标签、80 维特征和契约标识
+│  │  ├─ pcap_reader.py                  Scapy 读取抓包、链路层和 IP 层
+│  │  ├─ tcp_reassembly.py               TCP 排序、去重、重传与缺口处理
+│  │  ├─ tls_parser.py                   TLS record、Hello、SNI、ALPN 等
+│  │  ├─ x509_parser.py                  用 cryptography 解析 DER 证书
+│  │  ├─ extract_flow_features.py        唯一双向流和 80 维特征实现
+│  │  ├─ serialize_flow.py               结构化事件转 DeBERTa 输入文本
+│  │  ├─ flow_io.py                      读取和检查流 JSONL
+│  │  ├─ semantic_encoder.py             Encoder/LoRA 与 768 维 CLS
+│  │  ├─ supcon_reducer.py               加载 reducer.pt，压缩至 64 维
+│  │  ├─ lightgbm_detector.py            加载 LightGBM 和训练期预处理量
+│  │  ├─ model_loader.py                 解析并校验生产模型包
+│  │  └─ pipeline.py                     单个 PCAP 到最终结果的总入口
+│  ├─ backend/
+│  │  ├─ __init__.py                     子包声明
+│  │  ├─ server.py                       FastAPI、上传、任务、结果和 SSE API
+│  │  ├─ orchestrator.py                 排队、运行、取消和进度转发
+│  │  ├─ pipeline_runner.py              启动推理子进程并生成用户进度
+│  │  ├─ tasks_store.py                  SQLite 任务状态读写
+│  │  ├─ data_provider.py                只读取指定用户任务的结果
+│  │  └─ tls_log_parser.py               整理 TLS/X.509 详情数据
+│  └─ frontend/
+│     ├─ index.html                      首页、服务状态和最近检测
+│     ├─ upload.html                     抓包上传和四步用户进度
+│     ├─ detection.html                  风险概览与逐流结果
+│     ├─ alarms.html                     历史检测记录
+│     ├─ tls-analysis.html               指定任务的 TLS/证书详情
+│     └─ shared/
+│        ├─ real-data.js                 API、SSE、标签和公共视图函数
+│        └─ styles.css                   用户界面公共样式
+│
+├─ data/                                  开发数据与用户数据严格分离
+│  ├─ README.txt                          data 总规则
+│  ├─ developer/
+│  │  ├─ datasets/
+│  │  │  ├─ source/
+│  │  │  │  ├─ readme.txt                官网原件区总说明
+│  │  │  │  ├─ CIC-AndMal2017/
+│  │  │  │  │  ├─ archives/readme.txt    原始压缩包
+│  │  │  │  │  └─ extracted/readme.txt   原样解压内容
+│  │  │  │  └─ CIRA-CIC-DoHBrw-2020/
+│  │  │  │     ├─ archives/readme.txt    原始压缩包
+│  │  │  │     └─ extracted/readme.txt   原样解压内容
+│  │  │  ├─ manifests/readme.txt          哈希、标签、group_id、split
+│  │  │  └─ prepared/
+│  │  │     ├─ train/readme.txt           固定训练组 PCAP 硬链接
+│  │  │     ├─ validation/readme.txt      固定验证组 PCAP 硬链接
+│  │  │     └─ test/readme.txt            最终独立测试组
+│  │  └─ workspace/
+│  │     ├─ features/
+│  │     │  ├─ flow/readme.txt            80 维特征与时序元数据
+│  │     │  ├─ semantic/readme.txt        768 维 CLS 特征
+│  │     │  └─ fused/readme.txt           融合和 64 维降维特征
+│  │     ├─ corpus/
+│  │     │  ├─ pretrain/readme.txt        仅 train 组的 RTD 语料
+│  │     │  └─ supervised/splits/readme.txt  固定三集合 JSONL
+│  │     └─ evaluation/
+│  │        ├─ figures/readme.txt          混淆矩阵、ROC 和指标图
+│  │        ├─ predictions/                独立测试逐流预测和展示资产
+│  │        ├─ reports/                    分类报告和消融报告
+│  │        └─ benchmarks/                 时间、内存、显存和吞吐报告
+│  └─ runtime/
+│     ├─ uploads/readme.txt                用户上传短暂暂存区
+│     ├─ tasks/readme.txt                  每个任务的输入、预测和摘要
+│     └─ state/readme.txt                  tasks.db 等服务状态
+│
+├─ models/
+│  ├─ README.md                            模型目录规则
+│  ├─ base/
+│  │  ├─ deberta-v3-base/                  当前训练起点
+│  │  └─ deberta-base/                     历史下载，不是当前默认
+│  ├─ experiments/current/readme.txt        当前候选实验输出位置
+│  └─ production/
+│     ├─ active.json                       当前激活的 release_id
+│     └─ <release_id>/
+│        ├─ encoder/                       RTD Encoder
+│        ├─ lora/                          最佳 LoRA 适配器
+│        ├─ supcon/reducer.pt              SupCon-AE 及输入列契约
+│        ├─ detector/                      LightGBM、列顺序和中位数
+│        ├─ manifest.json                  发布身份和状态
+│        ├─ feature_schema.json            特征契约
+│        └─ label_mapping.json             标签顺序
+│
+├─ docs/
+│  ├─ 项目结构.md                          两条通道的简明结构说明
+│  ├─ 模型训练说明.md                      数据准备、训练和发布命令
+│  ├─ 系统复习文档.md                      概念和源码阅读顺序
+│  ├─ archive/
+│  │  ├─ 任务二实施指南.md                 早期任务二的实施记录
+│  │  ├─ 预训练问题分析.md                 早期预训练故障与判断记录
+│  │  ├─ GPT生成任务二数据提示词.md        早期数据生成提示词，仅追溯
+│  │  └─ 最初思路.docx                    项目最初设计思路
+│  ├─ assets/
+│  │  ├─ dashboard_reference.png           早期仪表盘参考图
+│  │  ├─ dashboards_discover.png           早期界面探索图
+│  │  └─ dashboards_discover_table.png     早期表格界面探索图
+│  └─ reports/
+│     ├─ 1780056556282726.pdf              原项目报告 PDF
+│     └─ 成都信息工程大学-欧鲁金-基于多维特征的异常加密流量检测系统-作品报告.docx
+│                                            原项目作品报告 Word 文档
+│
+├─ tests/
+│  ├─ test_architecture.py                依赖边界和目录结构
+│  ├─ unit/
+│  │  ├─ test_tcp_reassembly.py           乱序、重传、重叠、缺口
+│  │  ├─ test_tls_parser.py               ClientHello 与截断 record
+│  │  ├─ test_x509_parser.py              真实 DER 与畸形证书
+│  │  └─ test_group_split.py              数据泄漏拦截
+│  ├─ integration/
+│  │  ├─ test_pcap_extractor.py           抓包格式、链路层和 IP 分片
+│  │  └─ test_production_bundle.py        未发布时失败关闭
+│  ├─ developer/
+│  │  ├─ test_data_prepare.py             清单、标签和确定性划分
+│  │  └─ test_supcon_training.py          SupCon 保存、加载和列契约
+│  └─ backend/
+│     ├─ test_data_provider.py             任务结果和越界保护
+│     ├─ test_orchestrator.py              任务提交与取消
+│     ├─ test_pipeline_runner.py           推理子进程和进度事件
+│     ├─ test_tasks_store.py               SQLite 任务记录
+│     └─ test_tls_log_parser.py            TLS 详情整理
+│
+└─ legacy/                                遗产区，不参与正式运行
+   ├─ README.md                            遗产边界说明
+   ├─ code/
+   │  ├─ extract_flow_features_legacy.py   重构前的近似特征提取器
+   │  └─ truncate_flow_legacy.py           重构前的逐流截断器
+   ├─ models/production/v1/               不兼容的旧生产模型
+   ├─ docs/
+   │  ├─ README_legacy.md                  重构前的根说明
+   │  ├─ 系统复习文档_旧实现.md            旧系统复习说明
+   │  └─ MFF-LightGBM项目源码解析长文_旧实现.md  旧源码长文
+   ├─ raw_data_prepare/
+   │  ├─ csv_preprocessor.py               早期 CSV 预处理
+   │  ├─ pcap.py                           早期抓包处理
+   │  └─ pcap -200.py                      早期前 200 包处理
+   ├─ processed_csv/                      早期 CSV 产物
+   ├─ data/                               其他旧数据产物
+   └─ final/                              早期比赛/交付副本
+      ├─ extract_features.py               早期语义特征提取
+      ├─ feature show.py                   早期特征展示
+      ├─ LightGBM_Detector.py              早期检测器入口
+      ├─ pcap -200.py                      早期截断脚本副本
+      ├─ preprocess.py                     早期预处理副本
+      ├─ supcon_ae.py                      早期 SupCon-AE 副本
+      ├─ readme.txt                        早期交付说明
+      ├─ LightGBM_Detector/                早期检测代码、指标与图
+      ├─ supcon_ae/                        早期 SupCon 代码、权重与图
+      └─ data/csv/                         早期交付数据
 ```
 
-那么整体 IAT 为：
+`__init__.py` 通常没有业务逻辑，只用于声明 Python 包。每个数据叶子目录中的 `readme.txt` 是该目录允许存放什么的最终说明。
+
+---
+
+## 5. 抓包解析链做了什么
+
+### 5.1 PCAP/PCAPNG 与网络层
+
+`pcap_reader.py` 使用 Scapy 读取抓包，而不是自己猜文件头。当前覆盖：
+
+- PCAP 与 PCAPNG；
+- 大端、小端以及微秒/纳秒时间戳；
+- Ethernet、VLAN、Linux SLL、SLL2；
+- IPv4、IPv6、TCP、UDP；
+- IPv4/IPv6 分片重组。
+
+### 5.2 双向流与 TCP 重组
+
+同一 TCP/UDP 会话的两个方向合并成一条双向流。TCP 根据 sequence number 恢复乱序、去掉重复重传、裁剪重叠，并在捕获缺口处分段。它允许一个 TLS record 跨多个 TCP 包，也允许一个 TCP 包携带多个 TLS record。
+
+包长、IAT、Active/Idle 等统计量使用 Welford 单遍在线算法更新均值与方差，不需要把整条流的数值再复制一份到内存；双向总量和两个方向仍分别统计。
+
+### 5.3 TLS 与 X.509
+
+TLS 识别基于二进制 record/handshake，不依赖端口 443。当前解析 ClientHello、ServerHello、SNI、ALPN、supported_versions、cipher suites、extensions 和可见的 Certificate。
+
+证书 DER 交给 `cryptography.x509.load_der_x509_certificate()`，提取 Subject/CN、SAN、Issuer、Serial Number、有效期、签名算法、公钥和 SHA-256 指纹。
+
+TLS 1.3 的 ServerHello 后通常进入加密握手。没有会话密钥时看不到证书是正常情况，代码记录为缺失，不会伪造字段。SNI 是客户端想访问的主机名；CN/SAN 是证书声明的名称；Issuer 是签发者，三者不能混用。
+
+### 5.4 缺失值语义
+
+- `0`：确实观测到零；
+- `NaN/null`：没有观测到、无法解析或无法计算；
+- 不会为了填满表格而“近似造字段”。
+
+当前特征契约是 `strict-tls-x509-2026-09`。模型声明的契约不同，用户推理就拒绝加载。
+
+---
+
+## 6. 模型链怎么理解
+
+### 6.1 结构化文本和 CLS
+
+每条流的连接、TLS 和 X.509 信息先压缩为结构化事件序列。它不是让模型写文章，而是让编码器学习字段组合关系。
+
+`[CLS]` 是序列开头的特殊标记。经过 Transformer 后，它的隐藏向量可视为整条输入的摘要。本项目提取 768 维 CLS 作为流的语义特征。
+
+### 6.2 为什么是 DeBERTa-v3-base，不是生成式模型
+
+这里需要固定类别判别和稳定向量，不需要生成文本。编码式模型更适合分类与特征提取，训练、显存和推理成本也更可控。
+
+### 6.3 RTD、LoRA、SupCon-AE 和 LightGBM
+
+- RTD：用流量语料继续预训练，让 Encoder 熟悉 TLS、连接和证书字段分布。
+- LoRA：只训练少量低秩参数完成八分类适配。
+- SupCon-AE：把 768 维语义特征压缩为 64 维，使同类靠近、异类分离。
+- LightGBM：把 64 维语义特征与 80 维数值特征融合后完成八分类。
+
+语义分支是否真正有效必须由 `fused / semantic-only / manual-only` 消融证明，不能只凭模型结构下结论。
+
+---
+
+## 7. 为什么不用 Zeek
+
+项目目标环境是 Windows，因此正式链采用：
+
+- Scapy：抓包、链路层、IP/TCP/UDP；
+- 自有严格实现：双向流、TCP 重组和 TLS handshake；
+- cryptography：X.509 DER。
+
+不用 Zeek 是可行的，但意味着边界条件必须由测试保证。不要把 `legacy/` 中的近似解析器搬回正式代码。
+
+---
+
+## 8. 环境准备
+
+要求：Windows、Python 3.12、`uv`。训练 DeBERTa 建议使用 NVIDIA GPU；只运行解析器和测试不要求 GPU。
+
+```powershell
+cd E:\Work\ccb
+uv sync
+uv run pytest -q
+```
+
+回归测试数量会随功能增加，以本机 `uv run pytest -q` 的实时结果为准，不在文档里保存容易过期的数字。
+
+数据和模型很大，默认被 `.gitignore` 排除。代码、契约、目录说明和测试才应提交 Git。
+
+---
+
+## 9. 数据集下载位置
+
+当前优先使用：
+
+1. CIC-AndMal2017：`benign`、`adware`、`ransomware`、`scareware`、`smsmalware` 的主要来源。
+2. CIRA-CIC-DoHBrw-2020：`dns2tcp`、`dnscat2`、`iodine` 及相应正常场景。
+
+压缩包放到：
 
 ```text
-0.2秒、0.6秒、6.2秒、0.4秒
+E:\Work\ccb\data\developer\datasets\source\CIC-AndMal2017\archives\
+E:\Work\ccb\data\developer\datasets\source\CIRA-CIC-DoHBrw-2020\archives\
 ```
 
-相应统计量约为：
+原样解压到对应的：
 
 ```text
-iat_min  = 0.2
-iat_max  = 6.2
-iat_mean = 1.85
-iat_std  ≈ 2.52
+E:\Work\ccb\data\developer\datasets\source\<数据集>\extracted\
 ```
 
-其中6.2秒的长间隔明显区别于其余短间隔，它也会成为划分 Active 和 Idle 的依据。因为仅使用 IAT 可以观察单次间隔，却不能直接概括一条流经历了多少段连续活动。所以进一步使用5秒阈值，把时间轴划分为 Active 和 Idle：
+规则：
 
-- 相邻包间隔不超过5秒：仍然处于当前 Active 区间；
-- 相邻包间隔超过5秒：当前 Active 区间结束，这段长间隔记为一次 Idle，新包开始下一段 Active。
+- 正式端到端训练需要 PCAP/PCAPNG；CSV 用于辅助核对标签，不能替代抓包重新提取当前特征。
+- 保留官方目录层级与文件名，不要混合两个数据集。
+- 不要放到旧的 `data/pcap/raw`。
+- 用户上传不能放进 `data/developer`。
+- 下载未完成时不要建立清单或训练，避免扫描到半个压缩包。
 
-逐包处理代码如下：
+---
 
-```python
-gap = pkt_ts - flow["last_ts_active"]
+## 10. 下载完成后的数据准备
 
-if gap > 5.0:
-    # 上一段连续活动的持续时间
-    active_duration = (
-        flow["last_ts_active"] - flow["active_start"]
-    )
-    update_welford(flow["act_welford"], active_duration)
+### 10.1 建来源清单
 
-    # 两段活动之间的空闲时间
-    update_welford(flow["idl_welford"], gap)
-
-    # 当前包是新Active区间的起点
-    flow["active_start"] = pkt_ts
-
-flow["last_ts_active"] = pkt_ts
+```powershell
+uv run python -m developer.data_prepare.build_manifest `
+  --provenance data/developer/datasets/manifests/provenance.json `
+  --output data/developer/datasets/manifests/source_manifest.json
 ```
 
-对于需要根据完整时间戳序列离线计算的输出，可以使用下面的方法：
+清单需要核实路径、数据集、SHA-256 和八分类标签；尽可能补充 `sample_id`、`capture_id`、`apk_sha256`、family、设备、捕获批次、DoH 工具和 resolver。`provenance.json` 以 source 相对路径为键；需要整体划分的多个文件填写相同 `group_id`，并用 `group_basis` 记录依据。不能自动判断的标签必须人工核实。
 
-```python
-def get_active_idle_metrics_func(pkt_times, threshold=5.0):
-    if len(pkt_times) < 2:
-        return (0.0,) * 8
+### 10.2 固定分组划分
 
-    times = sorted(pkt_times)
-    active_intervals = []
-    idle_intervals = []
-    active_start = times[0]
-
-    for index in range(len(times) - 1):
-        gap = times[index + 1] - times[index]
-
-        if gap > threshold:
-            active_intervals.append(
-                times[index] - active_start
-            )
-            idle_intervals.append(gap)
-            active_start = times[index + 1]
-
-    # 保存最后一段Active区间
-    active_intervals.append(times[-1] - active_start)
-
-    active = get_stats_metrics_func(active_intervals)[:4]
-    idle = (
-        get_stats_metrics_func(idle_intervals)[:4]
-        if idle_intervals
-        else (0.0, 0.0, 0.0, 0.0)
-    )
-
-    return (*active, *idle)
+```powershell
+uv run python -m developer.data_prepare.split_dataset `
+  data/developer/datasets/manifests/source_manifest.json `
+  data/developer/datasets/manifests/split_manifest.json `
+  --materialize-root data/developer/datasets/prepared
 ```
 
-仍以前面的时间戳为例：
+分组优先级：
 
 ```text
-0.0 ── 0.2 ── 0.8 ────────── 7.0 ── 7.4
-└──── Active 1 ────┘  Idle   └─ Active 2 ─┘
+sample_id → capture_id → apk_sha256 → 文件 SHA-256
 ```
 
-划分结果为：
+程序会在每个“数据集 + 类别”内按完整来源组做 70/10/20 分配。同组只能位于 train、validation、test 之一，每层少于三个独立组会拒绝划分。`prepared/` 尽量使用同盘硬链接，不复制第二份巨大 PCAP。
+
+自动字段只能提供保底分组；如果同一 APK、恶意软件 family、捕获批次或 DoH 场景横跨多个 PCAP，应在 `provenance.json` 中为它们设置共同的显式 `group_id`，以数据集说明为准。
+
+禁止把全部 flow 随机打散后再切分；相同 PCAP、APK 或实验场景的流高度相似，这会造成数据泄漏和虚高指标。
+
+---
+
+## 11. 开发者训练命令
+
+第一次建议逐阶段执行：
+
+```powershell
+# prepared PCAP → 80 维流特征和结构化日志
+uv run python -m developer.pipeline --stage flow_features
+
+# 流特征 → RTD、LoRA、CLS 输入 JSONL
+uv run python -m developer.pipeline --stage preprocess
+
+# DeBERTa-v3 RTD 领域继续预训练
+uv run python -m developer.pipeline --stage pretrain
+
+# LoRA 八分类训练
+uv run python -m developer.pipeline --stage lora
+
+# 提取 768 维 CLS 并与数值特征对齐
+uv run python -m developer.pipeline --stage extract
+
+# SupCon-AE，输出 models/experiments/current/supcon/reducer.pt
+uv run python -m developer.pipeline --stage supcon
+
+# LightGBM 与固定 test 结果
+uv run python -m developer.pipeline --stage detector
+
+# fused / semantic-only / manual-only 消融
+uv run python -m developer.pipeline --stage evaluate
+```
+
+下面命令运行默认训练主链，但**不包含额外的 `evaluate` 消融阶段**：
+
+```powershell
+uv run python -m developer.pipeline --stage all
+```
+
+训练前检查 [`developer/representation/config.py`](developer/representation/config.py) 中的 batch size、epoch、学习率和显存参数。当前默认值偏向低显存 Windows 环境，不代表最终最优参数。
+
+---
+
+## 12. 评估与发布
+
+### 12.1 最低评估要求
+
+- 独立 test 的 accuracy、macro F1、weighted F1；
+- 每类 precision、recall、F1、support；
+- 混淆矩阵和 one-vs-rest ROC/AUC；
+- 三组特征消融；
+- 按数据来源观察泛化表现；
+- 解析吞吐、推理延迟、内存与显存；
+- 三个集合的 `group_id` 无交集。
+
+### 12.2 完整模型包
 
 ```text
-Active 1：0.8 - 0.0 = 0.8秒
-Idle：    7.0 - 0.8 = 6.2秒
-Active 2：7.4 - 7.0 = 0.4秒
+encoder/
+lora/
+supcon/reducer.pt
+detector/best_lgb_model.pkl
+detector/feature_columns.json
+detector/imputation_medians.json
+manifest.json
+feature_schema.json
+label_mapping.json
 ```
 
-最终分别对 Active 和 Idle 持续时间计算最大值、最小值、均值和标准差，形成8维特征：
+`imputation_medians.json` 只能由 train 拟合，在线不能拿用户当前上传重新计算。特征列、字段顺序和标签顺序必须与运行时契约一致。
 
-```text
-active_max、active_min、active_mean、active_std
-idle_max、idle_min、idle_mean、idle_std
+### 12.3 构建、校验和发布
+
+```powershell
+uv run python -m developer.release.build_contract `
+  models/experiments/<run_id> 2026-09-strict-parser
+
+uv run python -m developer.release.validate_bundle `
+  models/experiments/<run_id>
+
+uv run python -m developer.release.publish `
+  models/experiments/<run_id> 2026-09-strict-parser --activate
 ```
 
-加上整体、正向和反向三组 IAT 的12维，本节一共对应20维统计特征。固定周期的流量通常会表现出较稳定的 IAT 或 Idle 分布，而突发式交互流量的分布可能更加离散。不过，5秒只是当前我们做实验采用的特征工程阈值，并不是 TCP 或 TLS 协议规定；更换数据集或部署环境时，需要通过验证集重新评估这一阈值。
+发布标识只能含字母、数字、点、下划线和连字符。已发布目录不可覆盖。
 
-CN字符结构特征：
+当前 [`models/production/active.json`](models/production/active.json) 是：
 
-CN 是 Common Name 的缩写，是 X509 证书 Subject 中用于表示证书主体名称的字段。在 TLS 流量中，它通常与服务器域名有关。普通域名往往包含容易阅读的单词或品牌名称，而某些自动生成域名、DNS 隧道标识和恶意基础设施可能包含较长的随机字符串、大量数字或特殊字符。
-
-例如下面两个名称在字符结构上就有明显区别：
-
-```text
-www.example.com
-aj39dk2m91f0.example.com
-```
-
-模型不能直接把字符串交给 LightGBM，因此从 CN 中提取5个数值特征：
-
-| 字段                      | 计算方式                      | 表达的信息                         |
-| ------------------------- | ----------------------------- | ---------------------------------- |
-| `cn_vowel_ratio`          | 元音字母数 ÷ CN长度           | 字符串中自然语言式字母组合的比例   |
-| `cn_digit_density`        | 数字字符数 ÷ CN长度           | CN中数字的密集程度                 |
-| `cn_special_char_density` | 非字母且非数字字符数 ÷ CN长度 | 点、连字符等特殊字符的比例         |
-| `cn_length`               | `len(cn_value)`               | CN整体长度                         |
-| `cn_hash`                 | `MD5(CN) mod 1024`            | 将完整CN稳定映射为一个有限范围整数 |
-
-前三个比例可以根据字符密度来计算：
-
-```python
-def analyze_cn_structure(cn_str):
-    if not cn_str:
-        return 0.0, 0.0, 0.0
-
-    length = len(cn_str)
-
-    vowel_ratio = (
-        len(re.findall(r"[aeiouAEIOU]", cn_str))
-        / length
-    )
-    digit_density = (
-        len(re.findall(r"\d", cn_str))
-        / length
-    )
-    special_char_density = (
-        len(re.findall(r"[^a-zA-Z0-9]", cn_str))
-        / length
-    )
-
-    return (
-        round(vowel_ratio, 4),
-        round(digit_density, 4),
-        round(special_char_density, 4),
-    )
-```
-
-提取器从 TLS/证书日志中取得 CN 后，调用该函数并计算长度和哈希：
-
-```python
-cn_value = ssl_entry.get("cn")
-
-if cn_value:
-    (
-        cn_vowel_ratio,
-        cn_digit_density,
-        cn_special_char_density,
-    ) = analyze_cn_structure(cn_value)
-
-    cn_length = len(cn_value)
-    cn_hash = int(
-        hashlib.md5(cn_value.encode()).hexdigest(),
-        16,
-    ) % 1024
-```
-
-下面以 `www.example.com` 为例，依次统计：
-
-```text
-字符串总长度
-元音字母 a、e、i、o、u 出现的次数
-数字字符出现的次数
-点号等非字母、非数字字符出现的次数
-```
-
-再分别除以总长度，得到0到1之间的比例。比例特征比直接使用字符数量更容易比较不同长度的CN。例如两个CN都包含4个数字，但一个长度为10、另一个长度为40，它们的数字密度显然不同。
-
-`cn_hash` 的作用与字符比例不同。它将完整CN映射到0～1023，使相同CN得到相同数值，给模型提供一个粗粒度的身份标记。但哈希值的大小没有语义顺序，数值接近也不表示两个CN相似；取模后还可能发生碰撞。因此它只能作为辅助特征，不能单独用于判断域名或证书是否恶意。
-
-不过CN字符特征同样不是检测规则。合法CDN、对象存储和自动生成的云服务域名也可能很长、包含数字或特殊字符。它需要与包长、IAT、重连行为、证书有效期以及DeBERTa提取的TLS/X509语义特征共同使用。
-
-# 四、深层语义特征提取
-
-### 4.1 TLS/X509 日志序列化
-
-DeBERTa 是文本编码器， 所以需要先对 Zeek 风格日志进行一个序列化的处理，把连接、TLS 和证书字段压缩成结构稳定的文本。
-
-一条序列化结果大致类似：
-
-```text
-{"t":"c","proto":"tcp","svc":"ssl","dur":1.27,"state":"SF"}
-{"t":"s","ver":"TLSv12","cipher":"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256","sni":"api.example.com"}
-{"t":"x","issuer":"Let's Encrypt","key_alg":"rsaEncryption","key_len":2048}
-```
-
-这里的 `c`、`s`、`x` 分别表示 connection、SSL/TLS 和 X509 事件。使用紧凑字段名能减少 Token 数量，使有限的最大序列长度容纳更多有用信息。
-
-每条流最后写成一行 JSON：
-
-```python
-flows.append({
-    "flow_uid": canonical_flow_uid(row),
-    "src_ip": str(row["src_ip"]),
-    "dst_ip": str(row["dst_ip"]),
-    "text": text,
-    "label": label_id,
-    "label_name": label_name,
-    "num_events": num_events,
-    "num_features": extract_num_features(row),
-})
-```
-
-其中：
-
-- `text` 为序列化后的日志进入 DeBERTa；
-- `label` 用于 LoRA、SupCon-AE 和 LightGBM；
-- `num_features` 保存约 80 维人工特征；
-- `flow_uid` 用于将预测结果重新关联到原始流。
-
-源/目的 IP 等标识字段用于追踪和展示，不作为模型训练特征，避免模型记忆某个数据集中的固定地址。
-
-### 4.2 DeBERTa-v3 领域继续预训练
-
-通用 DeBERTa-v3 学习的是自然语言分布，而用于本次实验的输入包含 TLS 版本、密码套件、证书字段、连接状态和域名等等领域专用表示，所以在使用它前需要先继续预训练让编码器适应这种领域文本。
-
-这里我曾经尝试过用 MLM 和 SimCS 对 DeBERTa-v3 进行预训练，但发现训练过程中都会报NaN的错误，后面调研了才发现DeBERTa-v3 是使用 ELECTRA 风格的 RTD（Replaced Token Detection）训练的。它由 generator 和 discriminator 构成：
-
-1. 随机选择一部分普通 Token；
-2. 将这些位置替换为 `[MASK]`；
-3. generator 预测原 Token 并从分布中采样；
-4. 用采样 Token 构造 corrupted input；
-5. discriminator 判断每个 Token 是否被替换。
-
-这里`DebertaV3RTDPretrainer` 使用较浅的 generator 和完整 discriminator：
-
-```python
-disc_config = AutoConfig.from_pretrained(model_dir)
-gen_config = copy.deepcopy(disc_config)
-gen_config.num_hidden_layers = min(generator_layers, disc_config.num_hidden_layers)
-
-self.generator = AutoModel.from_pretrained(
-    model_dir,
-    config=gen_config,
-    ignore_mismatched_sizes=True,
-)
-self.discriminator = AutoModel.from_pretrained(
-    model_dir,
-    config=disc_config,
-)
-```
-
-Generator 预测词表概率，Discriminator 输出每个位置的二分类 Logit。forward 过程的核心代码如下：
-
-```python
-generator_outputs = self.generator(
-    input_ids=masked_input_ids,
-    attention_mask=attention_mask,
-)
-gen_logits = self.generator_lm_head(generator_outputs.last_hidden_state)
-gen_loss = F.cross_entropy(
-    gen_logits.view(-1, gen_logits.size(-1)),
-    mlm_labels.view(-1),
-    ignore_index=-100,
-)
-
-with torch.no_grad():
-    sampled_ids = sample_generator_tokens(gen_logits)
-    corrupted_input_ids = input_ids.clone()
-    corrupted_input_ids[mlm_mask] = sampled_ids[mlm_mask]
-    rtd_labels = ((corrupted_input_ids != input_ids) & mlm_mask).float()
-
-disc_outputs = self.discriminator(
-    input_ids=corrupted_input_ids,
-    attention_mask=attention_mask,
-)
-disc_logits = self.rtd_head(disc_outputs.last_hidden_state)
-```
-
-联合损失为：
-
-$$
-L_{RTD}=\lambda_g L_{generator}+\lambda_d L_{discriminator}
-$$
-保存最佳的 discriminator encoder。
-
-注意：Padding、CLS、SEP 和 MASK 等特殊 Token 不能参与随机 Mask，否则模型可能把 Padding 的固定规律当成简单答案，或者破坏序列边界，导致损失看似下降但没有学到有效领域知识。
-
-### 4.3 LoRA 八分类监督适配
-
-这里可能会有点疑问，最终不是 LightGBM 完成流量的分类吗？为什么这里还要让 DeBERTa-v3 完成一次分类呢？
-
-我来解释一下：如果只使用未经监督分类训练的 DeBERTa，它生成的向量主要表达：两段TLS/X509文本在一般语义或字段结构上是否相似。
-
-但我需要的是：哪些TLS/X509字段组合有助于区分正常流量、DNS隧道和恶意软件？
-
-例如下面两条流的文本结构可能非常接近：
-
-```
-TLS版本：TLS 1.2
-密码套件：AES_128_GCM
-SNI：www.example.com
-证书签发者：Let's Encrypt
-```
-
-```
-TLS版本：TLS 1.2
-密码套件：AES_128_GCM
-SNI：aj39dk2m91.example.com
-证书签发者：Unknown CA
-```
-
-未进行分类适配的 DeBERTa 更关注：
-
-```
-两条文本都包含TLS版本、密码套件、SNI和签发者
-```
-
-LoRA 分类训练则通过标签告诉模型：
-
-```
-哪些字段相同并不重要
-哪些字段差异对区分类别更加重要
-```
-
-训练完成后，DeBERTa 的隐藏空间会更偏向当前检测任务。
-
-完整过程其实是两级监督：
-
-```
-TLS/X509结构化文本
-        ↓
-DeBERTa-v3
-        ↓
-LoRA分类训练
-        ↓
-得到经过分类任务适配的DeBERTa编码器
-        ↓
-丢掉/不使用LoRA分类结果
-        ↓
-提取768维[CLS]语义向量
-        ↓
-SupCon-AE压缩到64维
-        ↓
-与80维人工特征融合
-        ↓
-LightGBM完成最终分类
-```
-
-模型构建代码如下：
-
-```python
-model = AutoModelForSequenceClassification.from_pretrained(
-    base_model_dir,
-    num_labels=NUM_LABELS,
-    problem_type="single_label_classification",
-    id2label=ID2LABEL,
-    label2id=LABEL2ID,
-)
-
-peft_config = LoraConfig(
-    task_type=TaskType.SEQ_CLS,
-    r=LORA_R,
-    lora_alpha=LORA_ALPHA,
-    lora_dropout=LORA_DROPOUT,
-    target_modules=LORA_TARGET_MODULES,
-    modules_to_save=["classifier", "pooler"],
-)
-model = get_peft_model(model, peft_config)
-```
-
-`classifier` 和 `pooler` 必须跟随 Adapter 保存，因为它们承担当前八分类任务，不能只保存注意力层的低秩参数。
-
-训练参数可以根据自己的配置来，这里就不多说。
-
-最后从最后一层提取 `[CLS]` 表示，核心逻辑可以概括为：
-
-```python
-with torch.no_grad():
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-        return_dict=True,
-    )
-    cls_features = outputs.hidden_states[-1][:, 0, :]
-```
-
-张量切片 `[:, 0, :]` 的含义是：
-
-- 第一维选择 Batch 中全部样本；
-- 第二维选择序列第 0 个位置，即 `[CLS]`；
-- 第三维保留全部隐藏维度。
-
-DeBERTa-v3-base 的隐藏维度为 768，所以每条流得到：
-
-```text
-[batch_size, sequence_length, 768]
-                    ↓ 取第0个Token
-[batch_size, 768]
-```
-
-# 五、特征降维融合
-
-前面说过直接把768维语义向量与约80维统计特征拼接，会出现两个问题：一是总维度较高、存在冗余；二是语义特征数量远多于统计特征，可能使融合结果被语义分支主导。所以需要把语义特征降维后再和统计特征融合。这里我们最终选择的降维方法是SupCon-AE。之前也尝试过用最简单的 PCA 算法，但 PCA 是寻找数据总体方差最大的线性方向，它不知道标签，最大方差方向不一定是最适合区分 benign、DNS 隧道和恶意软件的方向。而 SupCon-AE 可以同时加入两个目标：
-
-1. AutoEncoder 尽可能保留原始语义信息；
-2. Supervised Contrastive Learning 让同类靠近、异类远离。
-
-### 5.1 模型结构
-
-`SupConAE` 包含 Encoder、Decoder 和 Projector：
-
-```python
-class SupConAE(nn.Module):
-    def __init__(self, input_dim, hidden_dims, latent_dim, proj_dim, dropout):
-        super().__init__()
-        self.encoder = _mlp(
-            [input_dim, *hidden_dims, latent_dim],
-            dropout,
-            last_activation=False,
-        )
-        self.decoder = _mlp(
-            [latent_dim, *reversed(hidden_dims), input_dim],
-            dropout,
-            last_activation=False,
-        )
-        self.projector = _mlp(
-            [latent_dim, latent_dim, proj_dim],
-            dropout,
-            last_activation=False,
-        )
-
-    def forward(self, values):
-        latent = self.encoder(values)
-        reconstructed = self.decoder(latent)
-        projection = self.projector(latent)
-        return latent, reconstructed, projection
-```
-
-三个输出的用途分别为：
-
-| 输出            | 用途                         |
-| --------------- | ---------------------------- |
-| `latent`        | 64维最终表示，输入 LightGBM  |
-| `reconstructed` | 重构768维输入，计算重构损失  |
-| `projection`    | 计算监督对比损失，推理时不用 |
-
-这里使用 LayerNorm 而不是 BatchNorm，可以使较小 Batch 或最后一个不完整 Batch 的训练更加稳定。
-
-### 5.2 重构损失和监督对比损失
-
-AutoEncoder 的重构损失为：
-
-$$
-L_{recon}=\frac{1}{N}\sum_{i=1}^{N}\|x_i-\hat{x}_i\|_2^2
-$$
-
-```python
-reconstruction_loss = F.mse_loss(reconstructed, values)
-```
-
-它要求低维表示仍然保留足够信息，使 Decoder 能够近似恢复原来的 768 维向量。
-
-监督对比损失：
-
-对于锚点样本 `i`，设同类别样本集合为 `P(i)`：
-
-$$
-L_i=-\frac{1}{|P(i)|}\sum_{p\in P(i)}
-\log\frac{\exp(z_i\cdot z_p/\tau)}
-{\sum_{a\ne i}\exp(z_i\cdot z_a/\tau)}
-$$
-其中 `τ` 是温度参数。实现首先做 L2 归一化并计算 Batch 内两两相似度：
-
-```python
-features = F.normalize(projections, dim=1)
-logits = torch.matmul(features, features.T) / self.temperature
-```
-
-随后构造同类掩码并排除样本自身：
-
-```python
-labels = labels.view(-1, 1)
-positive_mask = labels.eq(labels.T)
-self_mask = torch.eye(len(labels), dtype=torch.bool, device=labels.device)
-positive_mask = positive_mask & ~self_mask
-```
-
-如果某个样本在当前 Batch 中没有同类样本，它无法产生有效正样本对，因此类均衡采样和合理 Batch Size 对 SupCon 很重要。
-
-最终损失为：
-
-$$
-L=\lambda_rL_{recon}+\lambda_cL_{supcon}
-$$
-
-```python
-loss = (
-    reconstruction_weight * reconstruction_loss
-    + contrastive_weight * contrastive_loss
-)
-```
-
-重构约束防止表示只追求类别分离而丢失结构信息，对比约束则使降维结果更适合后续分类。
-
-### 5.3 最终维度
-
-SupCon-AE 只替换语义列，人工特征保持不变：
-
-```python
-def replace_semantic_features(df, reducer):
-    columns = semantic_feature_columns(df)
-    latent = reducer.transform(df[columns], feature_columns=columns)
-    output = df.drop(columns=columns).copy()
-    for index in range(latent.shape[1]):
-        output[f"feat_{index}"] = latent[:, index]
-    return output
-```
-
-维度变化为：
-
-```text
-原融合特征：768维 DeBERTa + 约80维人工特征 = 848维
-SupCon-AE 后：64维语义特征 + 约80维人工特征 = 144维
-```
-
-这就是 MFF-LightGBM 中“多维特征融合”的具体含义。
-
-# 六、LightGBM 分类
-
-### 6.1 LightGBM介绍
-
-LightGBM 全称是 **Light Gradient Boosting Machine**，是一种基于梯度提升决策树（GBDT）的机器学习算法，尤其适合处理表格型数据。它并不是只训练一棵决策树，而是依次训练很多棵树：
-
-```
-第一棵树：先进行初步预测
-    ↓
-第二棵树：重点修正第一棵树的错误
-    ↓
-第三棵树：继续修正前两棵树的错误
-    ↓
-……
-    ↓
-组合所有树，得到最终预测
-```
-
-可以简单表示为：
-$$
-F_M(x)=F_0(x)+\sum_{m=1}^{M}\eta f_m(x)
-$$
-其中：
-
-- \(F_0(x)\)：初始预测；
-- \(f_m(x)\)：第 \(m\) 棵决策树；
-- \(\eta\)：学习率；
-- \(M\)：决策树数量。
-
-每棵新树都会学习当前模型还没有处理好的部分。
-
-与传统GBDT实现相比，LightGBM具有下面优势：
-
-- 训练速度快；
-- 内存占用相对低；
-- 能处理大量样本和高维特征；
-- 支持多分类；
-- 支持类别特征；
-- 支持并行和GPU训练。
-
-LightGBM会把连续特征值离散到若干个区间中，称为 Histogram，从而减少寻找决策树最佳分裂点的计算量。
-
-LightGBM如何完成分类？
-
-假设输入一条流量的特征：
-
-```
-包数量              = 35
-平均包长            = 512
-IAT均值             = 0.12秒
-重连次数            = 4
-证书有效期          = 30天
-SupCon-AE语义特征   = 64维
-```
-
-某棵决策树可能学习到类似规则：
-
-```
-IAT均值 < 0.2？
-├── 是：重连次数 > 3？
-│   ├── 是：更可能是恶意流量
-│   └── 否：继续判断证书特征
-└── 否：更可能是正常流量
-```
-
-实际上，LightGBM会组合大量决策树，而不是依靠单条固定规则。
-
-对于这次的八分类任务，它最终输出8个类别概率：
-
-```
-benign       0.03
-adware       0.04
-dns2tcp      0.78
-dnscat2      0.08
-iodine       0.03
-ransomware   0.01
-scareware    0.02
-smsmalware   0.01
-```
-
-最大概率对应最终预测：
-
-```
-预测类别：dns2tcp
-置信度：0.78
-```
-
-为什么选择LightGBM?
-
-SupCon-AE降维后，系统获得：
-
-```
-64维DeBERTa语义特征
-+
-80维流量统计特征
-=
-144维融合特征
-```
-
-这些数据已经属于典型的表格型数值数据，比较适合LightGBM。
-
-它能够学习：
-
-- 流量统计特征之间的非线性关系；
-- 语义特征与统计特征之间的组合关系；
-- 不同恶意类别的复杂决策边界；
-- 类别不平衡情况下的加权分类。
-
-相较于继续设计一个大型神经网络分类器，LightGBM训练更快，也更容易分析特征重要性。
-
-### 6.2 检测前预处理
-
-在进行分类检测前需要做的基础的数据预处理：
-
-1. 将字符串标签映射为整数；
-2. 删除不应参与训练的标识列和高基数字符串列；
-3. 对低基数字符串进行编码；
-5. 填补数值缺失值。
-
-模型训练特征筛选：
-
-```python
-return [
-    col
-    for col in df.columns
-    if col not in protected
-    and pd.api.types.is_numeric_dtype(df[col])
-]
-```
-
-标签、flow UID、源目的地址等 protected 字段不会进入 LightGBM。
-
-测试集中 benign 数量明显多于各恶意类别，所以还需要类别不平衡处理。这里通过类别平衡权重训练：
-
-```python
-sample_weights = compute_sample_weight(
-    class_weight="balanced",
-    y=y_train,
-)
-
-dtrain = lgb.Dataset(
-    X_train,
-    label=y_train,
-    weight=sample_weights,
-)
-```
-
-类别越少，单个样本获得的权重通常越高，从而降低模型只追求正常流量准确率的倾向。
-
-### 6.3 LightGBM 参数
-
-下面是我的LightGBM的参数，以供参考：
-
-```python
-params = {
-    "objective": "multiclass",
-    "num_class": 8,
-    "metric": "multi_logloss",
-    "boosting_type": "gbdt",
-    "num_leaves": 63,
-    "learning_rate": 0.03,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
-    "bagging_freq": 5,
-    "min_data_in_leaf": 50,
-    "lambda_l1": 0.1,
-    "lambda_l2": 0.1,
+```json
+{
+  "release_id": "unpublished"
 }
 ```
 
-`feature_fraction` 每轮只抽取部分特征，`bagging_fraction` 对样本进行子采样，L1/L2 正则降低过拟合。训练最多2000轮，验证集连续100轮不提升则停止：
+这是有意的失败关闭：旧模型由旧近似字段训练，不能读取当前严格特征。
 
-```python
-model = lgb.train(
-    params,
-    dtrain,
-    num_boost_round=2000,
-    valid_sets=[dval],
-    callbacks=[
-        lgb.early_stopping(100, verbose=False),
-        lgb.log_evaluation(100),
-    ],
-)
+---
+
+## 13. 用户系统
+
+兼容模型发布并激活后启动：
+
+```powershell
+uv run uvicorn user_app.backend.server:app
 ```
 
-正式训练中最佳迭代轮数为 761。
+访问 `http://127.0.0.1:8000/`。
 
-为了避免一次性构造过大的预测结果，测试集按4096条分批：
+用户页面只显示：读取抓包、分析连接、识别风险、生成结果。不存在训练入口、开发者评估接口或 demo 回放。
 
-```python
-def predict_in_batches(model, X):
-    chunks = []
-    for start in range(0, len(X), 4096):
-        batch = X[start:start + 4096]
-        proba = model.predict(batch, num_iteration=model.best_iteration)
-        chunks.append(proba)
-    return np.vstack(chunks)
+也可直接调用冻结推理：
+
+```powershell
+uv run python -m user_app.inference.pipeline `
+  --pcap <抓包文件> `
+  --output-dir <任务目录>
 ```
 
-每条流得到8个类别概率，最大概率对应预测类别，最大值作为置信度。
+主要 API：
 
-# 七、实验结果与指标解释
+```text
+GET  /api/status
+POST /api/analyze
+GET  /api/tasks
+GET  /api/tasks/{task_id}
+GET  /api/tasks/{task_id}/stream
+GET  /api/tasks/{task_id}/summary
+GET  /api/tasks/{task_id}/predictions
+GET  /api/tasks/{task_id}/flows
+GET  /api/tasks/{task_id}/flows/{flow_uid}
+POST /api/tasks/{task_id}/cancel
+GET  /api/labels
+```
 
-经过人工特征与DeBERTa语义特征融合后，数据集共包含40,052条双向流样本。每条样本最初由768维语义特征和80维人工数值特征表示。检测器采用分层随机划分，将28,035条样本作为训练集、4,006条作为验证集、8,011条作为测试集，比例约为70%：10%：20%。训练集用于学习模型参数，验证集用于SupCon-AE和LightGBM，测试集用于训练完成后的最终性能评估。
+---
 
-### 7.1 分类结果
+## 14. 用户任务产物
 
-| 类别       | Precision | Recall |     F1 | Support |
-| ---------- | --------: | -----: | -----: | ------: |
-| benign     |    0.9665 | 0.9749 | 0.9707 |    4946 |
-| adware     |    0.8718 | 0.8313 | 0.8511 |     581 |
-| dns2tcp    |    1.0000 | 0.9875 | 0.9937 |     240 |
-| dnscat2    |    0.9563 | 0.9837 | 0.9698 |     245 |
-| iodine     |    0.9872 | 0.9627 | 0.9748 |     241 |
-| ransomware |    0.8479 | 0.8333 | 0.8406 |     582 |
-| scareware  |    0.8805 | 0.8477 | 0.8638 |     591 |
-| smsmalware |    0.8408 | 0.8667 | 0.8535 |     585 |
+任务目录位于 `data/runtime/tasks/<task_id>/`，典型内容如下：
 
-整体指标：
+```text
+input.pcap / input.pcapng       上传抓包
+flow_features.csv               流级数值特征和结构化日志
+flow_temporal.csv               时序/窗口统计辅助信息
+flows.jsonl                     DeBERTa 逐流事件序列
+predictions.csv                 逐流类别和置信度
+summary.json                    文件级检测摘要
+readme.txt                      任务目录说明
+```
 
-| 指标        |   数值 |
-| ----------- | -----: |
-| Accuracy    | 0.9372 |
-| Macro F1    | 0.9148 |
-| Weighted F1 | 0.9369 |
+用户推理中的 768 维 CLS 和 64 维降维特征在内存中流转，不额外长期保存一份语义特征 CSV；开发者离线流程才会把它们写入 `data/developer/workspace/features/`。
 
-![image-20260810184223556](https://fastly.jsdelivr.net/gh/whyulooksad/image_bed@main/images/20260810184223855.png)
+实际文件名以 `user_app/inference/pipeline.py` 为准。用户任务不会进入开发者训练集。
 
-### 7.2 结果总结
+---
 
-模型在各类别上的预测结果主要集中在对角线位置，说明本文方法能够有效区分正常流量与多类恶意加密流量。测试集中，benign 类共有 4946 条样本，其中 4822 条被正确识别，表明模型对正常加密流量具有较强的识别能力。对于 dns2tcp、dnscat2 和 iodine 等隧道类流量，模型同样取得了较好的识别效果，正确分类样本数分别为 237、241 和 232，说明模型能够较好地捕获该类恶意加密流量在通信行为和流量特征上的差异。
+## 15. 测试
 
-从非对角线位置可以进一步观察到，少量样本在相近类别之间出现交叉预测，主要集中在 adware、ransomware、scareware 和 smsmalware 等类别中。这类流量在实际网络通信中可能具有相似的连接模式、包长分布或会话行为，因此分类边界相对更接近。尽管存在少量交叉预测，但整体误分类数量较少，模型仍能保持较稳定的多类别识别能力。
+```powershell
+uv run pytest -q
+uv run pytest tests/unit -q
+uv run pytest tests/integration -q
+uv run pytest tests/developer -q
+uv run pytest tests/backend -q
+uv run pytest tests/test_architecture.py -q
+```
 
-总体来看，混淆矩阵中正确分类样本占主要部分，各类别的预测结果整体较为集中，说明本文方法在多分类恶意加密流量检测任务中具有较好的整体性能和实用价值。
+测试验证：TCP 乱序和重传、捕获缺口、非 443 TLS、截断 record、畸形证书、多种抓包/链路格式、分组泄漏、目录越界、开发/用户边界，以及未发布模型时的失败关闭。
 
-### 7.3 最终交付
+---
 
-1.加密通信流量分析工具。
+## 16. 必须守住的规则
 
-2.异常行为检测模型。
+1. **只有一份特征提取器。** 不为训练和 Web 各复制一份。
+2. **不恢复抓包前 N 包截断。** 它会破坏 TCP/TLS 重组。
+3. **不按端口判断 TLS。** 443 不一定是 TLS，TLS 也不限于 443。
+4. **不伪造 X.509。** 看不到或解析失败就是缺失。
+5. **不随机拆 flow。** 必须按 PCAP/APK/sample/capture 分组。
+6. **预训练不能看 test。** RTD 也只能使用 train 组。
+7. **预处理量只在 train 拟合。** 包括中位数、PCA 和其他统计量。
+8. **用户上传不自动训练。** 两类数据物理隔离。
+9. **生产模型不可覆盖。** 新发布使用新的 release_id。
+10. **legacy 只追溯。** 旧指标和行为不代表当前系统。
 
-3.实验环境：正常流量与攻击流量的检测对比。
+---
+
+## 17. 常见问题
+
+### 为什么现在页面不能完成检测？
+
+旧模型已经归档，新数据尚未完成下载和训练。让旧模型读取新特征会得到无意义结果，因此系统明确拒绝，而不是假装可用。
+
+### `encrypted_traffic_detection.egg-info` 是什么？
+
+它是 Python 安装或构建工具生成的包元数据，不是业务源码。当前 `uv` 配置为 `package = false`，该目录不应属于项目结构，`.gitignore` 也会忽略 `*.egg-info/`。
+
+### 为什么没有 `src/mff_lightgbm/`？
+
+当前项目不是准备发布到 PyPI 的通用库。直接使用 `developer/` 和 `user_app/` 更直观地表达开发者通道与用户通道。
+
+### 为什么没有 `scripts/`？
+
+稳定入口已经是 Python 模块命令。暂时不维护一批 `.ps1` 包装脚本；真正出现重复、稳定的部署操作时再增加。
+
+### 外部 CSV 能不能直接训练？
+
+如果字段与当前 80 维特征契约不完全一致，就不能直接训练当前 LightGBM。CSV 可用于研究或标签核对，但正式端到端模型应从 PCAP 经唯一提取器重新生成特征。
+
+### TLS 1.3 为什么经常没有证书？
+
+ServerHello 后通常已经进入加密握手。没有会话密钥时无法看到 Certificate 是正常结果，不一定是解析错误。
+
+---
+
+## 18. 当前待办
+
+1. 等两个数据集完整下载。
+2. 校验压缩包并原样解压。
+3. 建立 `source_manifest.json`。
+4. 人工核对八类标签和来源分组。
+5. 生成固定 `split_manifest.json` 和 prepared 硬链接。
+6. 分阶段训练并检查每步输出。
+7. 在固定 test 上做指标、消融和资源测试。
+8. 构建模型契约，校验并发布 production release。
+9. 完成真实用户上传的端到端验收。
+
+专项说明：
+
+- [`docs/项目结构.md`](docs/项目结构.md)
+- [`docs/模型训练说明.md`](docs/模型训练说明.md)
+- [`docs/系统复习文档.md`](docs/系统复习文档.md)
+- [`developer/README.md`](developer/README.md)
+- [`user_app/README.md`](user_app/README.md)
+- [`models/README.md`](models/README.md)
+- [`legacy/README.md`](legacy/README.md)

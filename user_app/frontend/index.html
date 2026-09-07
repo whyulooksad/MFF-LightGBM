@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>首页 · 加密流量安全检测</title>
+  <link rel="stylesheet" href="shared/styles.css?v=4">
+</head>
+<body>
+  <div id="topbar"></div><div id="sidebar"></div>
+  <main class="main user-main">
+    <section class="welcome-panel">
+      <div class="welcome-copy">
+        <span class="eyebrow">网络流量安全检查</span>
+        <h1>上传抓包文件，快速发现异常加密流量</h1>
+        <p>无需解密通信内容。系统会分析连接行为并标出可疑流量，帮助你快速定位 DNS 隧道、勒索软件等安全风险。</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary btn-lg" href="upload.html">开始检测</a>
+          <a class="btn btn-ghost btn-lg" href="alarms.html">查看检测记录</a>
+        </div>
+        <div class="trust-row"><span>✓ 支持 PCAP / PCAPNG</span><span>✓ 不解密通信内容</span><span>✓ 自动生成检测结果</span></div>
+      </div>
+      <div class="welcome-visual" aria-hidden="true">
+        <div class="shield-orbit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></div>
+        <div class="scan-note"><span class="status-dot"></span> <span data-service-status>正在检查服务</span></div>
+      </div>
+    </section>
+    <section class="section-block">
+      <div class="section-heading"><div><h2>最近检测</h2><p>继续查看最近完成的检测结果</p></div><a href="alarms.html" class="text-link">查看全部 →</a></div>
+      <div class="history-list" id="recentTasks"><div class="empty-friendly">正在加载检测记录…</div></div>
+    </section>
+    <section class="help-strip">
+      <div><strong>检测什么？</strong><span>正常流量、广告软件、DNS 隧道、勒索软件、恐吓软件和短信恶意软件。</span></div>
+      <div><strong>如何开始？</strong><span>选择抓包文件并开始检测，完成后会自动展示风险结果。</span></div>
+    </section>
+  </main>
+  <script src="shared/real-data.js?v=3"></script>
+  <script>
+    document.getElementById('topbar').innerHTML = renderTopbar();
+    document.getElementById('sidebar').innerHTML = renderSidebar('dashboard');
+    fetchTasks(8).then(tasks => {
+      const recentTasks = tasks.slice(0, 4);
+      document.getElementById('recentTasks').innerHTML = recentTasks.length ? recentTasks.map(t => {
+        const status = statusInfo(t.status), canOpen = t.status === 'done';
+        const content = `<div class="history-main"><div class="file-mark">PCAP</div><div><strong>${escapeHTML(displayFilename(t.pcap_filename))}</strong><span>${formatDateTime(t.started_at)}</span></div></div><div class="history-actions"><span class="tag ${status.className}">${status.name}</span>${canOpen ? '<span class="row-arrow">查看结果 →</span>' : ''}</div>`;
+        return canOpen ? `<a class="history-row" href="detection.html?task=${encodeURIComponent(t.task_id)}">${content}</a>` : `<div class="history-row">${content}</div>`;
+      }).join('') : `<div class="empty-friendly"><strong>还没有检测记录</strong><span>上传第一份抓包文件，检测结果会保存在这里。</span><a class="btn btn-primary" href="upload.html">开始第一次检测</a></div>`;
+    }).catch(() => { document.getElementById('recentTasks').innerHTML = '<div class="empty-friendly">暂时无法加载检测记录，请稍后刷新。</div>'; });
+  </script>
+</body>
+</html>

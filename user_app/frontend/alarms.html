@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>检测记录 · 加密流量安全检测</title>
+  <link rel="stylesheet" href="shared/styles.css?v=4">
+</head>
+<body>
+  <div id="topbar"></div><div id="sidebar"></div>
+  <main class="main user-main">
+    <div class="page-header clean-header history-header">
+      <div><span class="eyebrow">历史记录</span><h1>检测记录</h1><div class="subtitle">查看以前上传的抓包文件及其检测状态。</div></div>
+      <a class="btn btn-primary btn-lg" href="upload.html">新建检测</a>
+    </div>
+    <section class="section-block">
+      <div class="history-tabs"><button class="active" data-filter="all">全部</button><button data-filter="done">已完成</button><button data-filter="running">检测中</button><button data-filter="other">未完成</button></div>
+      <div class="history-list full" id="taskList"><div class="empty-friendly">正在加载检测记录…</div></div>
+    </section>
+  </main>
+  <script src="shared/real-data.js?v=3"></script>
+  <script>
+    document.getElementById('topbar').innerHTML = renderTopbar();
+    document.getElementById('sidebar').innerHTML = renderSidebar('history');
+    let allTasks = [], activeFilter = 'all';
+    function render() {
+      const tasks = allTasks.filter(t => activeFilter === 'all' || (activeFilter === 'other' ? !['done','running'].includes(t.status) : t.status === activeFilter));
+      const list = document.getElementById('taskList');
+      list.innerHTML = tasks.length ? tasks.map(t => {
+        const status = statusInfo(t.status), canOpen = t.status === 'done';
+        const content = `<div class="history-main"><div class="file-mark">PCAP</div><div><strong>${escapeHTML(displayFilename(t.pcap_filename))}</strong><span>${formatDateTime(t.started_at)}</span></div></div><div class="history-actions"><span class="tag ${status.className}">${status.name}</span>${canOpen ? '<span class="row-arrow">查看结果 →</span>' : ''}</div>`;
+        return canOpen ? `<a class="history-row" href="detection.html?task=${encodeURIComponent(t.task_id)}">${content}</a>` : `<div class="history-row">${content}</div>`;
+      }).join('') : '<div class="empty-friendly"><strong>没有符合条件的记录</strong><span>新检测会显示在这里。</span></div>';
+    }
+    document.querySelectorAll('.history-tabs button').forEach(button => button.onclick = () => {
+      document.querySelectorAll('.history-tabs button').forEach(b => b.classList.toggle('active', b === button));
+      activeFilter = button.dataset.filter; render();
+    });
+    fetchTasks(100).then(tasks => { allTasks = tasks; render(); })
+      .catch(() => { document.getElementById('taskList').innerHTML = '<div class="empty-friendly text-danger">记录加载失败，请稍后刷新。</div>'; });
+  </script>
+</body>
+</html>
