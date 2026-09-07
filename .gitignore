@@ -59,6 +59,7 @@ Desktop.ini
 /data/**/*
 !/data/**/
 !/data/**/readme.txt
+!/data/README.txt
 /data/runtime/tasks/*/
 /data_example/
 
@@ -101,6 +102,9 @@ Desktop.ini
 
 # Generated legacy experiment figures/data
 /legacy/models/
+/legacy/data/workspace_pre_strict_parser/**/*
+!/legacy/data/workspace_pre_strict_parser/
+!/legacy/data/workspace_pre_strict_parser/README.md
 /legacy/**/*.png
 /legacy/**/*.jpg
 /legacy/**/*.jpeg

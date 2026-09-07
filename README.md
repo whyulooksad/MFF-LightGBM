@@ -9,7 +9,7 @@
 
 语义特征经过 SupCon-AE 压缩后与 80 维数值特征融合，最终由 LightGBM 输出八分类结果。
 
-> 当前状态：源码重构和严格解析器已经完成，旧代码与旧模型已经归档；公开数据集仍在下载，因此兼容新特征契约的生产模型尚未重新训练。用户页面可以启动，但上传检测会在模型发布前明确提示“检测模型尚未就绪”。
+> 当前状态：源码重构、严格解析器、两个公开数据集的原样接入和分组划分均已完成。官方原件共发现 15,280 个 PCAP，其中 15,279 个可用、1 个官方零字节 iodine 抓包被保留追溯但排除；当前固定划分为 train 10,084、validation 2,066、test 3,129，`prepared/` 均为同盘硬链接。新模型尚未训练和发布，`models/production/active.json` 仍为 `unpublished`，所以用户页面会明确提示“检测模型尚未就绪”。
 
 ---
 
@@ -118,7 +118,7 @@ E:\Work\ccb
 │  ├─ representation/
 │  │  ├─ __init__.py                     子包声明
 │  │  ├─ config.py                       DeBERTa、RTD、LoRA 路径和超参数
-│  │  ├─ split_input_csv.py              生成预训练与监督训练输入表
+│  │  ├─ split_input_csv.py              可选导出 RTD/监督 CSV（主流水线不调用）
 │  │  ├─ dataset.py                      加载固定划分并构造 DataLoader
 │  │  ├─ pretrain.py                     DeBERTa-v3 RTD 领域继续预训练
 │  │  └─ train_lora.py                   LoRA 八分类训练和最佳适配器保存
@@ -252,13 +252,19 @@ E:\Work\ccb
 │  │  ├─ test_tcp_reassembly.py           乱序、重传、重叠、缺口
 │  │  ├─ test_tls_parser.py               ClientHello 与截断 record
 │  │  ├─ test_x509_parser.py              真实 DER 与畸形证书
+│  │  ├─ test_serialize_flow.py           结构化事件序列化契约
 │  │  └─ test_group_split.py              数据泄漏拦截
 │  ├─ integration/
 │  │  ├─ test_pcap_extractor.py           抓包格式、链路层和 IP 分片
 │  │  └─ test_production_bundle.py        未发布时失败关闭
 │  ├─ developer/
 │  │  ├─ test_data_prepare.py             清单、标签和确定性划分
-│  │  └─ test_supcon_training.py          SupCon 保存、加载和列契约
+│  │  ├─ test_batch_extract.py            prepared/manifest 严格对齐
+│  │  ├─ test_training_boundaries.py      train/validation/test 使用边界
+│  │  ├─ test_lazy_datasets.py            大语料惰性读取
+│  │  ├─ test_supcon_training.py          SupCon 保存、加载和列契约
+│  │  ├─ test_evaluate.py                 评估标签兼容性
+│  │  └─ test_release_validation.py       候选模型包完整性
 │  └─ backend/
 │     ├─ test_data_provider.py             任务结果和越界保护
 │     ├─ test_orchestrator.py              任务提交与取消
@@ -281,7 +287,8 @@ E:\Work\ccb
    │  ├─ pcap.py                           早期抓包处理
    │  └─ pcap -200.py                      早期前 200 包处理
    ├─ processed_csv/                      早期 CSV 产物
-   ├─ data/                               其他旧数据产物
+   ├─ data/
+   │  └─ workspace_pre_strict_parser/     严格解析器前的 54 个旧工作区文件
    └─ final/                              早期比赛/交付副本
       ├─ extract_features.py               早期语义特征提取
       ├─ feature show.py                   早期特征展示
@@ -386,9 +393,9 @@ uv run pytest -q
 
 ---
 
-## 9. 数据集下载位置
+## 9. 数据集位置与当前接入状态
 
-当前优先使用：
+当前已经接入：
 
 1. CIC-AndMal2017：`benign`、`adware`、`ransomware`、`scareware`、`smsmalware` 的主要来源。
 2. CIRA-CIC-DoHBrw-2020：`dns2tcp`、`dnscat2`、`iodine` 及相应正常场景。
@@ -412,21 +419,22 @@ E:\Work\ccb\data\developer\datasets\source\<数据集>\extracted\
 - 保留官方目录层级与文件名，不要混合两个数据集。
 - 不要放到旧的 `data/pcap/raw`。
 - 用户上传不能放进 `data/developer`。
-- 下载未完成时不要建立清单或训练，避免扫描到半个压缩包。
+- 以后重新下载或补充数据时，必须等解压完整后再重建清单，避免扫描到半个文件。
+
+本次接入已经完成：`source_manifest.json` 记录 15,280 个抓包；其中 15,279 个进入固定划分，1 个官方零字节 iodine 抓包以 `usable=false` 留在清单中。当前分配为 train 10,084、validation 2,066、test 3,129，且不存在跨集合的 `group_id`。
 
 ---
 
-## 10. 下载完成后的数据准备
+## 10. 数据接入与重新生成方法
 
 ### 10.1 建来源清单
 
 ```powershell
 uv run python -m developer.data_prepare.build_manifest `
-  --provenance data/developer/datasets/manifests/provenance.json `
   --output data/developer/datasets/manifests/source_manifest.json
 ```
 
-清单需要核实路径、数据集、SHA-256 和八分类标签；尽可能补充 `sample_id`、`capture_id`、`apk_sha256`、family、设备、捕获批次、DoH 工具和 resolver。`provenance.json` 以 source 相对路径为键；需要整体划分的多个文件填写相同 `group_id`，并用 `group_basis` 记录依据。不能自动判断的标签必须人工核实。
+本次清单和划分已经生成，无需在训练前重复执行。只有 source 原件发生变化时才重新运行本节命令。当前两个官方数据集不需要手写 `provenance.json`。清单程序直接从保留的官方目录和文件名生成路径、数据集、SHA-256、八分类标签及来源字段：AndMal 恶意流量按 family、正常流量按 Android package；DoH 恶意流量按“工具 + 配置 + resolver”、正常流量按“浏览器 + resolver”形成不可拆分组。无法识别的布局会在划分阶段明确失败，不会静默改成逐 PCAP 随机划分。`--provenance` 仅用于未来新数据集的可选显式覆盖。
 
 ### 10.2 固定分组划分
 
@@ -443,9 +451,9 @@ uv run python -m developer.data_prepare.split_dataset `
 sample_id → capture_id → apk_sha256 → 文件 SHA-256
 ```
 
-程序会在每个“数据集 + 类别”内按完整来源组做 70/10/20 分配。同组只能位于 train、validation、test 之一，每层少于三个独立组会拒绝划分。`prepared/` 尽量使用同盘硬链接，不复制第二份巨大 PCAP。
+程序会在每个“数据集 + 类别”内按完整来源组做 70/10/20 分配，并在不拆组的前提下尽量平衡实际 PCAP 数量。同组只能位于 train、validation、test 之一，每层少于三个独立组会拒绝划分。校验结果写入 `data/developer/datasets/manifests/split_report.json`；只有全部分层都有三个集合且不存在同组跨集合才通过。`prepared/` 使用同盘硬链接，不复制第二份巨大 PCAP。
 
-自动字段只能提供保底分组；如果同一 APK、恶意软件 family、捕获批次或 DoH 场景横跨多个 PCAP，应在 `provenance.json` 中为它们设置共同的显式 `group_id`，以数据集说明为准。
+当前官方布局的来源规则已固化在代码和测试中，不需要人工整理。如果以后官方布局变化或接入第三个数据集，程序会先拒绝未知来源；应完善接入规则和测试后再生成划分，而不是手改结果文件。
 
 禁止把全部 flow 随机打散后再切分；相同 PCAP、APK 或实验场景的流高度相似，这会造成数据泄漏和虚高指标。
 
@@ -481,7 +489,7 @@ uv run python -m developer.pipeline --stage detector
 uv run python -m developer.pipeline --stage evaluate
 ```
 
-下面命令运行默认训练主链，但**不包含额外的 `evaluate` 消融阶段**：
+现在可以直接运行下面的默认训练主链。它依次执行 `flow_features → preprocess → pretrain → lora → extract → supcon → detector`，但**不重建 manifest/prepared，也不包含 `evaluate`、模型契约构建、校验或发布**：
 
 ```powershell
 uv run python -m developer.pipeline --stage all
@@ -638,7 +646,7 @@ uv run pytest tests/test_architecture.py -q
 
 ### 为什么现在页面不能完成检测？
 
-旧模型已经归档，新数据尚未完成下载和训练。让旧模型读取新特征会得到无意义结果，因此系统明确拒绝，而不是假装可用。
+旧模型已经归档，新数据已经准备完成，但兼容严格解析器的新模型尚未训练和发布。让旧模型读取新特征会得到无意义结果，因此系统明确拒绝，而不是假装可用。
 
 ### `encrypted_traffic_detection.egg-info` 是什么？
 
@@ -664,15 +672,12 @@ ServerHello 后通常已经进入加密握手。没有会话密钥时无法看�
 
 ## 18. 当前待办
 
-1. 等两个数据集完整下载。
-2. 校验压缩包并原样解压。
-3. 建立 `source_manifest.json`。
-4. 人工核对八类标签和来源分组。
-5. 生成固定 `split_manifest.json` 和 prepared 硬链接。
-6. 分阶段训练并检查每步输出。
-7. 在固定 test 上做指标、消融和资源测试。
-8. 构建模型契约，校验并发布 production release。
-9. 完成真实用户上传的端到端验收。
+数据下载、官方目录识别、清单生成、分组划分和 prepared 硬链接均已完成。接下来只剩：
+
+1. 运行 `uv run python -m developer.pipeline --stage all` 完成默认训练主链。
+2. 运行 `uv run python -m developer.pipeline --stage evaluate` 完成三组消融，并按需执行资源基准测试。
+3. 构建契约、校验候选模型包并发布、激活 production release。
+4. 用真实用户 PCAP 完成一次端到端上传验收。
 
 专项说明：
 

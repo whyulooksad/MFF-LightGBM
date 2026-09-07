@@ -28,8 +28,7 @@ LABEL2ID = {name: idx for idx, name in enumerate(CLASS_LABELS)}
 ID2LABEL = {idx: name for name, idx in LABEL2ID.items()}
 NUM_LABELS = len(CLASS_LABELS)
 
-# Numeric flow-feature columns from the current 94-column
-# final_multiclass_features_train/test.csv schema.
+# Canonical 80 numeric flow-feature columns emitted by the strict extractor.
 #
 # Excluded on purpose:
 # - identifiers / five-tuple / time: flow_uid, src_ip, src_port, dst_ip,

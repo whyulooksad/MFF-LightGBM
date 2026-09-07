@@ -18,6 +18,20 @@ REQUIRED = (
 
 def validate_bundle(root: Path) -> list[str]:
     errors = [f"缺少 {name}" for name in REQUIRED if not (root / name).exists()]
+    encoder_root = root / "encoder"
+    encoder_checkpoints = sorted(path for path in encoder_root.glob("checkpoint-*") if path.is_dir())
+    if encoder_root.exists() and not any(
+        (path / "config.json").is_file()
+        and any((path / name).is_file() for name in ("model.safetensors", "pytorch_model.bin"))
+        for path in encoder_checkpoints
+    ):
+        errors.append("encoder 中没有包含配置和权重的 checkpoint-*")
+    lora_best = root / "lora" / "best"
+    if (root / "lora").exists() and not (
+        (lora_best / "adapter_config.json").is_file()
+        and any((lora_best / name).is_file() for name in ("adapter_model.safetensors", "adapter_model.bin"))
+    ):
+        errors.append("lora/best 中缺少 adapter 配置或权重")
     labels_path = root / "label_mapping.json"
     if labels_path.exists():
         try:
@@ -55,6 +69,20 @@ def validate_bundle(root: Path) -> list[str]:
                 errors.append(f"detector 缺少 SupCon-AE 输出列: {missing_semantic[:8]}")
         except (OSError, ValueError, TypeError) as exc:
             errors.append(f"detector/feature_columns.json 无法读取: {exc}")
+    medians_path = root / "detector" / "imputation_medians.json"
+    if feature_columns_path.exists() and medians_path.exists():
+        try:
+            columns = json.loads(feature_columns_path.read_text(encoding="utf-8"))
+            medians = json.loads(medians_path.read_text(encoding="utf-8"))
+            missing_medians = [column for column in columns if column not in medians]
+            unknown_medians = [column for column in medians if column not in columns]
+            if missing_medians or unknown_medians:
+                errors.append(
+                    "detector 中位数与特征列不一致: "
+                    f"缺少={missing_medians[:8]}, 多余={unknown_medians[:8]}"
+                )
+        except (OSError, ValueError, TypeError) as exc:
+            errors.append(f"detector/imputation_medians.json 无法读取: {exc}")
     return errors
 
 

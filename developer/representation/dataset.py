@@ -39,41 +39,31 @@ class FlowDataset(Dataset):
     """
 
     def __init__(self, flows, tokenizer, max_length=MAX_LENGTH):
+        self.flows = flows
         self.tokenizer = tokenizer
         self.max_length = max_length
-
-        self.input_ids = []
-        self.attention_mask = []
         self.labels = []
 
         for flow in flows:
-            # 分词
-            encoded = tokenizer(
-                flow["text"],
-                max_length=max_length,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-            )
-            self.input_ids.append(encoded["input_ids"].squeeze(0))
-            self.attention_mask.append(encoded["attention_mask"].squeeze(0))
             if flow.get("label") is None:
                 raise ValueError("FlowDataset requires label; use supervised_flows.jsonl for LoRA training")
             self.labels.append(flow["label"])
-
-        # 转成大 Tensor，比逐条取快
-        self.input_ids = torch.stack(self.input_ids)
-        self.attention_mask = torch.stack(self.attention_mask)
-        self.labels = torch.tensor(self.labels, dtype=torch.long)
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
+        encoded = self.tokenizer(
+            self.flows[idx]["text"],
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
         return {
-            "input_ids": self.input_ids[idx],
-            "attention_mask": self.attention_mask[idx],
-            "labels": self.labels[idx],
+            "input_ids": encoded["input_ids"].squeeze(0),
+            "attention_mask": encoded["attention_mask"].squeeze(0),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
         }
 
 

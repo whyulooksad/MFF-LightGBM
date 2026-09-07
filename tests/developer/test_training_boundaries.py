@@ -7,12 +7,18 @@ import pytest
 from developer.detector.pca_baseline import reduce_feat_in_memory
 from developer.detector.train_lightgbm import preprocess_detector_dataframe
 from developer.representation.pretrain import load_rtd_texts
+from developer.representation import train_lora
+from developer.representation.config import SUPERVISED_FLOWS_JSONL
+from user_app.inference.contract import FEATURE_SCHEMA_VERSION
 
 
 def test_rtd_holdout_is_group_based_and_deterministic(tmp_path):
     path = tmp_path / "pretrain.jsonl"
     rows = [
-        {"text": f"group-{group}-flow-{flow}", "group_id": f"group-{group}", "label": group % 2}
+        {
+            "text": f"group-{group}-flow-{flow}", "group_id": f"group-{group}",
+            "label": group % 2, "split": "train", "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        }
         for group in range(10)
         for flow in range(2)
     ]
@@ -23,6 +29,20 @@ def test_rtd_holdout_is_group_based_and_deterministic(tmp_path):
     train_groups = {text.split("-flow-")[0] for text in train_a}
     holdout_groups = {text.split("-flow-")[0] for text in holdout_a}
     assert train_groups.isdisjoint(holdout_groups)
+
+
+def test_rtd_rejects_stale_or_non_train_corpus(tmp_path):
+    stale = tmp_path / "stale.jsonl"
+    stale.write_text(json.dumps({"text": "x", "group_id": "g", "split": "train"}) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="特征契约不一致"):
+        load_rtd_texts(stale)
+
+    test_data = tmp_path / "test.jsonl"
+    test_data.write_text(json.dumps({
+        "text": "x", "group_id": "g", "split": "test", "feature_schema_version": FEATURE_SCHEMA_VERSION,
+    }) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="只能包含外层 train"):
+        load_rtd_texts(test_data)
 
 
 def test_pca_fit_is_unchanged_when_only_test_values_change():
@@ -43,3 +63,11 @@ def test_detector_rejects_ad_hoc_categorical_encoding():
     frame = pd.DataFrame({"label": [0, 1], "unexpected_text": ["a", "b"]})
     with pytest.raises(ValueError, match="禁止在全数据上"):
         preprocess_detector_dataframe(frame)
+
+
+def test_lora_default_entry_reads_current_supervised_corpus(monkeypatch):
+    seen = []
+    monkeypatch.setattr(train_lora, "load_flows", lambda path: seen.append(path) or [])
+    with pytest.raises(ValueError, match="没有可用于LoRA"):
+        train_lora.train_lora_classifier(base_model_dir="unused", epochs=1)
+    assert seen == [SUPERVISED_FLOWS_JSONL]

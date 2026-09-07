@@ -7,7 +7,7 @@ uv run uvicorn user_app.backend.server:app
 uv run python -m user_app.inference.pipeline --pcap <文件> --output-dir <任务目录>
 ```
 
-输入和结果只写入 `data/runtime`。运行时只加载 `models/production/active.json` 指向、且通过特征契约校验的完整模型包。当前没有兼容新解析器的已发布模型时，检测会明确报错；开发者需要先完成重新训练和发布。
+输入和结果只写入 `data/runtime`。运行时只加载 `models/production/active.json` 当前指向、且通过特征契约校验的完整模型包；服务运行期间如果 active release 改变，后续任务会按新指向重新解析模型包。当前值仍是 `unpublished`，因此检测会明确报错；开发者需要先完成重新训练、评估、校验和发布。
 
 ```text
 原始 PCAP/PCAPNG

@@ -44,5 +44,3 @@ LORA_DROPOUT = 0.1
 LORA_TARGET_MODULES = ["query_proj", "value_proj", "key_proj"]
 
 SEED = 42
-TRAIN_RATIO = 0.6
-VAL_RATIO = 0.2

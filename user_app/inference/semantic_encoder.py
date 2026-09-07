@@ -54,6 +54,7 @@
 """
 
 import csv
+import json
 import os
 from pathlib import Path
 
@@ -70,7 +71,6 @@ from user_app.inference.contract import (
     ID2LABEL,
     LABEL2ID,
 )
-from user_app.inference.flow_io import load_flows
 
 
 FEATURE_DIM = 768
@@ -128,35 +128,30 @@ class FeatureDataset(Dataset):
     """Dataset for final feature extraction; label is optional here."""
 
     def __init__(self, flows, tokenizer, max_length=MAX_LENGTH):
-        self.input_ids = []
-        self.attention_mask = []
+        self.flows = flows
+        self.tokenizer = tokenizer
+        self.max_length = max_length
         self.labels = []
 
         for flow in flows:
-            encoded = tokenizer(
-                flow["text"],
-                max_length=max_length,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-            )
-            self.input_ids.append(encoded["input_ids"].squeeze(0))
-            self.attention_mask.append(encoded["attention_mask"].squeeze(0))
             label = flow.get("label")
             self.labels.append(-1 if label is None else int(label))
-
-        self.input_ids = torch.stack(self.input_ids)
-        self.attention_mask = torch.stack(self.attention_mask)
-        self.labels = torch.tensor(self.labels, dtype=torch.long)
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
+        encoded = self.tokenizer(
+            self.flows[idx]["text"],
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
         return {
-            "input_ids": self.input_ids[idx],
-            "attention_mask": self.attention_mask[idx],
-            "labels": self.labels[idx],
+            "input_ids": encoded["input_ids"].squeeze(0),
+            "attention_mask": encoded["attention_mask"].squeeze(0),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
         }
 
 
@@ -224,6 +219,41 @@ def write_feature_csv(flows, features, output_path, fused=False):
     print(f"  写出: {output_path}")
 
 
+def _flow_chunks(jsonl_path: str | Path, chunk_size: int, max_samples: int | None = None):
+    chunk = []
+    emitted = 0
+    with Path(jsonl_path).open("r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            if max_samples is not None and emitted >= max_samples:
+                break
+            chunk.append(json.loads(line))
+            emitted += 1
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+    if chunk:
+        yield chunk
+
+
+def _feature_row(flow: dict, vector: list[float], fused: bool) -> dict:
+    row = {
+        "flow_uid": flow.get("flow_uid", ""),
+        "label": flow.get("label"),
+        "label_name": flow.get("label_name", ""),
+    }
+    for col in ("feature_schema_version", "group_id", "split", "pcap_filename", "dataset_source"):
+        row[col] = flow.get(col)
+    for idx, value in enumerate(vector):
+        row[f"feat_{idx}"] = value
+    if fused:
+        num_features = flow.get("num_features", {}) or {}
+        for col in NEW_FORMAT_NUM_FEATURES:
+            row[col] = num_features.get(col)
+    return row
+
+
 def extract_features(
     base_model_dir=None,
     adapter_dir=None,
@@ -238,13 +268,12 @@ def extract_features(
         batch_size = LORA_BATCH_SIZE
 
     print("=" * 60)
-    print("[1/4] 读取待提取特征的流")
+    print("[1/4] 检查待提取特征的流")
     if jsonl_path is None:
         raise ValueError("jsonl_path 必须由调用通道显式提供")
-    flows = load_flows(jsonl_path)
-    if max_samples is not None:
-        flows = flows[:max_samples]
-    print(f"  总流数: {len(flows):,}")
+    jsonl_path = Path(jsonl_path)
+    if not jsonl_path.is_file():
+        raise FileNotFoundError(f"流 JSONL 不存在: {jsonl_path}")
 
     print("\n[2/4] 加载模型和tokenizer")
     if base_model_dir is None:
@@ -260,25 +289,54 @@ def extract_features(
 
     tokenizer = load_tokenizer(tokenizer_dir)
 
-    print("\n[3/4] 构造DataLoader并提取[CLS]")
-    dataset = build_feature_dataset(flows, tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
+    print("\n[3/4] 分块构造DataLoader并提取[CLS]")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  设备: {device}")
     model.to(device)
-
-    features, labels = extract_cls_features(model, dataloader, device)
-    if len(features) != len(flows):
-        raise RuntimeError("特征数量与流数量不一致")
-    if features and len(features[0]) != FEATURE_DIM:
-        raise RuntimeError(f"特征维度不是{FEATURE_DIM}: {len(features[0])}")
 
     print("\n[4/4] 写出CSV")
     if output_pure_csv is None or output_fused_csv is None:
         raise ValueError("两个输出 CSV 路径必须由调用通道显式提供")
 
-    write_feature_csv(flows, features, output_pure_csv, fused=False)
-    write_feature_csv(flows, features, output_fused_csv, fused=True)
+    pure_path, fused_path = Path(output_pure_csv), Path(output_fused_csv)
+    pure_path.parent.mkdir(parents=True, exist_ok=True)
+    fused_path.parent.mkdir(parents=True, exist_ok=True)
+    pure_tmp = pure_path.with_suffix(pure_path.suffix + ".tmp")
+    fused_tmp = fused_path.with_suffix(fused_path.suffix + ".tmp")
+    feat_cols = [f"feat_{i}" for i in range(FEATURE_DIM)]
+    provenance_cols = ["feature_schema_version", "group_id", "split", "pcap_filename", "dataset_source"]
+    pure_fields = ["flow_uid", *provenance_cols, *feat_cols, "label", "label_name"]
+    fused_fields = ["flow_uid", *provenance_cols, *feat_cols, *NEW_FORMAT_NUM_FEATURES, "label", "label_name"]
+    written = 0
+    try:
+        with pure_tmp.open("w", encoding="utf-8", newline="") as pure_stream, fused_tmp.open(
+            "w", encoding="utf-8", newline=""
+        ) as fused_stream:
+            pure_writer = csv.DictWriter(pure_stream, fieldnames=pure_fields)
+            fused_writer = csv.DictWriter(fused_stream, fieldnames=fused_fields)
+            pure_writer.writeheader()
+            fused_writer.writeheader()
+            chunk_size = max(256, int(batch_size) * 32)
+            for flows in _flow_chunks(jsonl_path, chunk_size, max_samples):
+                dataset = build_feature_dataset(flows, tokenizer)
+                dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+                features, _ = extract_cls_features(model, dataloader, device)
+                if len(features) != len(flows):
+                    raise RuntimeError("特征数量与流数量不一致")
+                if features and len(features[0]) != FEATURE_DIM:
+                    raise RuntimeError(f"特征维度不是{FEATURE_DIM}: {len(features[0])}")
+                pure_writer.writerows(_feature_row(flow, vector, False) for flow, vector in zip(flows, features))
+                fused_writer.writerows(_feature_row(flow, vector, True) for flow, vector in zip(flows, features))
+                written += len(flows)
+        if written == 0:
+            raise ValueError("流 JSONL 中没有可提取的记录")
+        os.replace(pure_tmp, pure_path)
+        os.replace(fused_tmp, fused_path)
+    finally:
+        pure_tmp.unlink(missing_ok=True)
+        fused_tmp.unlink(missing_ok=True)
+    print(f"  总流数: {written:,}")
+    print(f"  写出: {pure_path}")
+    print(f"  写出: {fused_path}")
 
     return output_pure_csv, output_fused_csv

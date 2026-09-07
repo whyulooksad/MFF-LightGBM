@@ -12,10 +12,16 @@ from sklearn.metrics import accuracy_score, classification_report, f1_score
 
 def evaluate(predictions: Path, output: Path) -> dict:
     frame = pd.read_csv(predictions)
-    true_column = "label" if "label" in frame else "true_label"
-    pred_column = "pred_label_name" if "pred_label_name" in frame else "pred_label"
-    if true_column not in frame or pred_column not in frame:
+    compatible_pairs = (
+        ("true_label_name", "pred_label_name"),
+        ("true_label", "pred_label"),
+        ("label", "pred_label_name"),
+        ("label", "pred_label"),
+    )
+    columns = next(((true, pred) for true, pred in compatible_pairs if true in frame and pred in frame), None)
+    if columns is None:
         raise ValueError("预测文件必须包含 label/true_label 和 pred_label_name/pred_label")
+    true_column, pred_column = columns
     metrics = {
         "accuracy": accuracy_score(frame[true_column], frame[pred_column]),
         "macro_f1": f1_score(frame[true_column], frame[pred_column], average="macro"),

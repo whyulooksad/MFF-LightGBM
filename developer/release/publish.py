@@ -30,6 +30,7 @@ def publish(source: Path, release_id: str, activate: bool = False) -> Path:
         json.dumps(published_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     if activate:
+        ACTIVE_MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
         ACTIVE_MODEL_FILE.write_text(json.dumps({"release_id": release_id}, indent=2), encoding="utf-8")
     return destination
 

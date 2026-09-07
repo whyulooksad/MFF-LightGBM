@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
+import warnings
 
 from cryptography import x509
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
@@ -33,3 +35,13 @@ def test_malformed_der_is_explicitly_missing_not_fabricated():
     assert parsed["parse_status"] == "error"
     assert parsed["parse_error"]
     assert "certificate.subject" not in parsed
+
+
+def test_deprecated_certificate_is_an_explicit_error(monkeypatch):
+    def warn_on_load(_der):
+        warnings.warn("non-positive serial", CryptographyDeprecationWarning)
+
+    monkeypatch.setattr(x509, "load_der_x509_certificate", warn_on_load)
+    parsed = parse_der_certificate(b"legacy")
+    assert parsed["parse_status"] == "error"
+    assert "CryptographyDeprecationWarning" in parsed["parse_error"]

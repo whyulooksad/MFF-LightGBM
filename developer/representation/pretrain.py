@@ -19,6 +19,70 @@
 
 输出：
     models/experiments/current/encoder/checkpoint-epoch*/ 下的 DeBERTa encoder 权重。
+
+
+    pretrain_flows.jsonl
+    每行一条流量文本，并带group_id
+            │
+            ▼
+    按group_id切分
+    ├── RTD fit
+    └── RTD holdout
+            │
+            ▼
+    Tokenizer分词
+    文本 → 最多256个token ID
+            │
+            ▼
+    随机选择约15%的普通token
+    并替换为[MASK]
+            │
+            ▼
+    Generator
+    较小的6层DeBERTa
+            │
+            ▼
+    MLM Head
+    预测被遮住的原token
+            │
+            ▼
+    按预测概率随机采样token
+    放回原文
+            │
+            ▼
+    构造corrupted input
+    真假token混合文本
+            │
+            ▼
+    Discriminator
+    完整DeBERTa
+            │
+            ▼
+    RTD Head
+    判断每个普通token是否被替换
+            │
+            ▼
+    总损失
+    Generator MLM损失
+    +
+    50 × Discriminator RTD损失
+            │
+            ▼
+    反向传播
+    调整Generator和Discriminator参数
+            │
+            ▼
+    每个epoch在holdout上检查损失
+            │
+            ├──改善：保存Discriminator Encoder
+            │
+            └──连续2轮未改善：提前停止
+            │
+            ▼
+    checkpoint-epoch*/
+            │
+            ▼
+    后续train_lora.py加载
 """
 
 import copy
@@ -53,6 +117,7 @@ from developer.representation.config import (
         PRETRAIN_WARMUP,
         SEED,
 )
+from user_app.inference.contract import FEATURE_SCHEMA_VERSION
 
 
 MLM_PROBABILITY = 0.15
@@ -297,6 +362,13 @@ def load_rtd_texts(jsonl_path=None, holdout_ratio=0.1):
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             obj = json.loads(line)
+            if obj.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
+                raise ValueError(
+                    f"RTD语料特征契约不一致，必须先运行 preprocess："
+                    f"expected={FEATURE_SCHEMA_VERSION}, got={obj.get('feature_schema_version')}"
+                )
+            if obj.get("split") != "train":
+                raise ValueError("RTD语料只能包含外层 train，禁止 validation/test 进入领域预训练")
             text = obj.get("text", "")
             group_id = str(obj.get("group_id") or "").strip()
             if text:

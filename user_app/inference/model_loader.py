@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from user_app.inference.config import ACTIVE_RELEASE_ID, PRODUCTION_MODEL_DIR
+from user_app.inference.config import ACTIVE_MODEL_FILE, PRODUCTION_ROOT
 from user_app.inference.contract import CLASS_LABELS, FEATURE_SCHEMA_VERSION
 
 
@@ -17,7 +17,12 @@ class ProductionBundle:
 
     @classmethod
     def active(cls) -> "ProductionBundle":
-        return cls(ACTIVE_RELEASE_ID, PRODUCTION_MODEL_DIR)
+        try:
+            value = json.loads(ACTIVE_MODEL_FILE.read_text(encoding="utf-8"))
+            release_id = str(value.get("release_id", "")).strip() or "unpublished"
+        except (OSError, ValueError, TypeError):
+            release_id = "unpublished"
+        return cls(release_id, PRODUCTION_ROOT / release_id)
 
     @property
     def encoder(self) -> Path:
@@ -50,6 +55,20 @@ class ProductionBundle:
 
     def validate(self) -> None:
         missing = [str(path) for path in self.required_paths() if not path.exists()]
+        encoder_checkpoints = sorted(path for path in self.encoder.glob("checkpoint-*") if path.is_dir())
+        valid_encoders = [
+            path for path in encoder_checkpoints
+            if (path / "config.json").is_file()
+            and any((path / name).is_file() for name in ("model.safetensors", "pytorch_model.bin"))
+        ]
+        if self.encoder.exists() and not valid_encoders:
+            missing.append(str(self.encoder / "checkpoint-*/{config.json,model weights}"))
+        lora_best = self.lora / "best"
+        if self.lora.exists() and not (
+            (lora_best / "adapter_config.json").is_file()
+            and any((lora_best / name).is_file() for name in ("adapter_model.safetensors", "adapter_model.bin"))
+        ):
+            missing.append(str(lora_best / "{adapter_config.json,adapter weights}"))
         if missing:
             raise FileNotFoundError("生产模型包缺少文件:\n  " + "\n  ".join(missing))
         labels = json.loads((self.root / "label_mapping.json").read_text(encoding="utf-8"))["labels"]

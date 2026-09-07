@@ -23,6 +23,7 @@ from user_app.inference.config import (
     WEB_STATIC_DIR,
 )
 from user_app.inference.model_loader import load_active_bundle
+from user_app.inference.contract import CLASS_LABELS
 
 BASE = str(ROOT)
 FRONTEND_DIR = str(WEB_STATIC_DIR)
@@ -166,9 +167,4 @@ async def cancel_task(task_id: str):
 
 @app.get("/api/labels")
 async def labels():
-    return [
-        {"id": 0, "name": "benign"}, {"id": 1, "name": "adware"},
-        {"id": 2, "name": "dns2tcp"}, {"id": 3, "name": "dnscat2"},
-        {"id": 4, "name": "iodine"}, {"id": 5, "name": "ransomware"},
-        {"id": 6, "name": "scareware"}, {"id": 7, "name": "smsmalware"},
-    ]
+    return [{"id": index, "name": name} for index, name in enumerate(CLASS_LABELS)]

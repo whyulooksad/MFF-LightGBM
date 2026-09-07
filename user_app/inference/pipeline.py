@@ -18,6 +18,15 @@ Stdout protocol consumed by the web runner (one marker per line):
     @@PROGRESS:<no>:<frac>           progress within a stage (0..1)
     @@TASK_DONE:<json>               final summary
 Everything else is human-readable logging.
+
+这份文件做的事情，可以完整翻译成：
+用户给我一份 PCAP 和一个结果保存目录。我先确认 PCAP 文件存在，再读取当前激活的生产模型版本，检查 DeBERTa、LoRA、SupCon-AE、LightGBM、标签映射和特征契约是否齐全且互相兼容。
+接着我启动一个独立子进程解析 PCAP。子进程把数据包组合成双向流，进行 TCP 重组、TLS 和证书解析，并提取 80 个人工网络特征。如果十分钟仍未完成，我就终止它。
+特征提取完成后，我把连接日志、TLS 日志和证书日志整理成 DeBERTa 能读的结构化文本，并保存为 flows.jsonl。
+然后我加载生产版 DeBERTa Encoder 和 LoRA Adapter，把流量文本分词、补齐或截断到 512 个 token，按批送入模型，为每条流生成 768 个语义数字。
+接着我把这 768 个语义数字与 80 个人工特征组合起来。SupCon-AE 把 768 个语义数字压缩成 64 个，再将 64 个语义特征与 80 个人工特征交给 LightGBM。
+LightGBM 为每条流输出 8 个类别概率。我选择概率最大的类别作为最终预测，并把这个最大概率作为置信度。
+最后，我通过 flow_uid 把预测结果与源 IP、目标 IP、端口和协议重新合并，写出逐流预测文件 predictions.csv，再统计总流数、恶意流数、恶意比例、类别数量和阶段耗时，写出 summary.json，最后通知网页任务已经完成。
 """
 
 from __future__ import annotations

@@ -44,6 +44,7 @@ from developer.representation.config import (
         LABEL2ID,
         PRETRAIN_DIR,
         SEED,
+        SUPERVISED_FLOWS_JSONL,
 )
 from developer.representation.dataset import FlowDataset, materialize_authoritative_splits, load_flows
 
@@ -153,6 +154,9 @@ def train_lora_classifier(
     grad_accum_steps=None,
 ):
     set_seed(SEED)
+
+    if jsonl_path is None:
+        jsonl_path = SUPERVISED_FLOWS_JSONL
 
     if epochs is None:
         epochs = LORA_EPOCHS

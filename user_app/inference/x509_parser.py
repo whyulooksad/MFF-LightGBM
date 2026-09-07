@@ -22,9 +22,11 @@ x509_parser.py
 from __future__ import annotations
 
 import hashlib
+import warnings
 from typing import Any
 
 from cryptography import x509
+from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, rsa
 from cryptography.x509.oid import NameOID
 
@@ -53,7 +55,21 @@ def parse_der_certificate(der: bytes) -> dict[str, Any]:
         base["parse_error"] = "empty DER certificate"
         return base
     try:
-        cert = x509.load_der_x509_certificate(der)
+        # Keep behaviour stable across cryptography upgrades: legacy
+        # certificates that are already deprecated become an explicit missing
+        # parse instead of succeeding today and crashing after an upgrade.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CryptographyDeprecationWarning)
+            cert = x509.load_der_x509_certificate(der)
+            return _parse_loaded_certificate(cert, base)
+    except Exception as exc:  # malformed third-party input must not kill the PCAP
+        base["parse_error"] = f"{type(exc).__name__}: {exc}"
+    return base
+
+
+def _parse_loaded_certificate(cert: x509.Certificate, base: dict[str, Any]) -> dict[str, Any]:
+    """Read fields while deprecation warnings remain errors in the caller."""
+    try:
         pub = cert.public_key()
         key_type, key_length, curve = _public_key_info(pub)
         cn_values = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
